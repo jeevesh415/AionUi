@@ -4,21 +4,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { CodexAgentManager } from '@/agent/codex';
-import { GeminiAgent, GeminiApprovalStore } from '@/agent/gemini';
-import type { TChatConversation } from '@/common/storage';
+import type { CodexAgentManager } from '@process/agent/codex';
+import { GeminiAgent, GeminiApprovalStore } from '@process/agent/gemini';
+import type { TChatConversation } from '@/common/config/storage';
 import type { IAgentManager } from '@process/task/IAgentManager';
 import type { IConversationService } from '@process/services/IConversationService';
 import type { IWorkerTaskManager } from '@process/task/IWorkerTaskManager';
-import { ipcBridge } from '../../common';
-import { getSkillsDir, ProcessChat } from '../initStorage';
+import { ipcBridge } from '@/common';
+import { getSkillsDir, getBuiltinSkillsCopyDir, getSystemDir, ProcessChat } from '@process/utils/initStorage';
 import type AcpAgentManager from '../task/AcpAgentManager';
 import type { GeminiAgentManager } from '../task/GeminiAgentManager';
 import type OpenClawAgentManager from '../task/OpenClawAgentManager';
 import { prepareFirstMessage } from '../task/agentUtils';
-import { refreshTrayMenu } from '../tray';
-import { copyFilesToDirectory, readDirectoryRecursive } from '../utils';
-import { computeOpenClawIdentityHash } from '../utils/openclawUtils';
+import { refreshTrayMenu } from '@process/utils/tray';
+import { copyFilesToDirectory, readDirectoryRecursive } from '@process/utils';
+import { computeOpenClawIdentityHash } from '@process/utils/openclawUtils';
 import { migrateConversationToDatabase } from './migrationUtils';
 
 const refreshTrayMenuSafely = async (): Promise<void> => {
@@ -65,7 +65,11 @@ export function initConversationBridge(
       const identityHash = await computeOpenClawIdentityHash(diagnostics.workspace || conversation.extra?.workspace);
       const conversationModel = (conversation as { model?: { useModel?: string } }).model;
       const extra = conversation.extra as
-        | { cliPath?: string; gateway?: { cliPath?: string }; runtimeValidation?: unknown }
+        | {
+            cliPath?: string;
+            gateway?: { cliPath?: string };
+            runtimeValidation?: unknown;
+          }
         | undefined;
       const gatewayCliPath = extra?.gateway?.cliPath;
 
@@ -88,7 +92,10 @@ export function initConversationBridge(
         },
       };
     } catch (error) {
-      return { success: false, msg: error instanceof Error ? error.message : String(error) };
+      return {
+        success: false,
+        msg: error instanceof Error ? error.message : String(error),
+      };
     }
   });
 
@@ -116,7 +123,10 @@ export function initConversationBridge(
       await (task as GeminiAgentManager).reloadContext();
       return { success: true };
     } catch (e: unknown) {
-      return { success: false, msg: e instanceof Error ? e.message : String(e) };
+      return {
+        success: false,
+        msg: e instanceof Error ? e.message : String(e),
+      };
     }
   });
 
@@ -164,12 +174,13 @@ export function initConversationBridge(
   ipcBridge.conversation.createWithConversation.provider(
     async ({ conversation, sourceConversationId, migrateCron }) => {
       try {
-        void workerTaskManager.getOrBuildTask(conversation.id);
-
         const result = await conversationService.createWithMigration({
           conversation,
           sourceConversationId,
           migrateCron,
+        });
+        workerTaskManager.getOrBuildTask(result.id).catch((err) => {
+          console.warn('[conversationBridge] Failed to pre-warm task after migration:', err);
         });
         emitConversationListChanged(result, 'created');
         if (sourceConversationId) {
@@ -198,7 +209,7 @@ export function initConversationBridge(
       if (source && source !== 'aionui') {
         try {
           // Dynamic import to avoid circular dependency
-          const { getChannelManager } = await import('@/channels/core/ChannelManager');
+          const { getChannelManager } = await import('@process/channels/core/ChannelManager');
           const channelManager = getChannelManager();
           if (channelManager.isInitialized()) {
             await channelManager.cleanupConversation(id);
@@ -246,7 +257,7 @@ export function initConversationBridge(
           }
         }
 
-        if (Object.hasOwn(updates, 'name')) {
+        if ('name' in updates) {
           await refreshTrayMenuSafely();
         }
 
@@ -257,6 +268,22 @@ export function initConversationBridge(
       }
     }
   );
+
+  // Pre-warm conversation bootstrap: trigger getOrBuildTask early so that
+  // the worker is ready when the user sends their first message.
+  // For ACP agents, also trigger initAgent() to start the CLI subprocess
+  // (~7s). Stream events are suppressed during bootstrap (via `bootstrapping`
+  // flag) to avoid triggering the sidebar loading spinner prematurely.
+  ipcBridge.conversation.warmup.provider(async ({ conversation_id }) => {
+    try {
+      const task = await workerTaskManager.getOrBuildTask(conversation_id);
+      if (task && task.type === 'acp') {
+        await (task as unknown as AcpAgentManager).initAgent();
+      }
+    } catch {
+      // Ignore errors — warmup is best-effort
+    }
+  });
 
   ipcBridge.conversation.reset.provider(({ id }) => {
     if (id) {
@@ -358,7 +385,10 @@ export function initConversationBridge(
       const commands = await task.loadAcpSlashCommands();
       return { success: true, data: { commands } };
     } catch (error) {
-      return { success: false, msg: error instanceof Error ? error.message : String(error) };
+      return {
+        success: false,
+        msg: error instanceof Error ? error.message : String(error),
+      };
     }
   });
 
@@ -370,7 +400,10 @@ export function initConversationBridge(
       task = await workerTaskManager.getOrBuildTask(conversation_id);
     } catch (err) {
       console.error(`[conversationBridge] sendMessage: failed to get/build task: ${conversation_id}`, err);
-      return { success: false, msg: err instanceof Error ? err.message : 'conversation not found' };
+      return {
+        success: false,
+        msg: err instanceof Error ? err.message : 'conversation not found',
+      };
     }
 
     if (!task) {
@@ -378,20 +411,23 @@ export function initConversationBridge(
     }
 
     // Copy files to workspace (unified for all agents)
-    const workspaceFiles = await copyFilesToDirectory(task.workspace, files, false);
+    const workspaceFiles = await copyFilesToDirectory(task.workspace, files, false, getSystemDir().cacheDir);
 
     // Precompute agent content with optional skill injection.
     // OpenClaw uses full-content mode: inject full skill text rather than index paths,
     // because the CLI may not proactively read SKILL.md files the way ACP agents do.
     let agentContent = other.input;
     if (other.injectSkills?.length) {
-      agentContent = await prepareFirstMessage(other.input, { enabledSkills: other.injectSkills });
+      agentContent = await prepareFirstMessage(other.input, {
+        enabledSkills: other.injectSkills,
+      });
       // Provide absolute skills directory so agent can resolve relative script paths
       // e.g. "skills/star-office-helper/scripts/..." → "${skillsDir}/star-office-helper/scripts/..."
       const skillsDir = getSkillsDir();
+      const builtinSkillsCopyDir = getBuiltinSkillsCopyDir();
       agentContent = agentContent.replace(
         '[User Request]',
-        `[Skills Directory]\nSkills are installed at: ${skillsDir}\nWhen skill instructions reference relative paths like "skills/{name}/scripts/...", resolve them as "${skillsDir}/{name}/scripts/...".\n\n[User Request]`
+        `[Skills Directory]\nBuiltin skills: ${builtinSkillsCopyDir}\nUser skills: ${skillsDir}\nWhen skill instructions reference relative paths like "skills/{name}/scripts/...", resolve them under the appropriate directory.\n\n[User Request]`
       );
     }
 
@@ -407,7 +443,10 @@ export function initConversationBridge(
       });
       return { success: true };
     } catch (err: unknown) {
-      return { success: false, msg: err instanceof Error ? err.message : String(err) };
+      return {
+        success: false,
+        msg: err instanceof Error ? err.message : String(err),
+      };
     }
   });
 

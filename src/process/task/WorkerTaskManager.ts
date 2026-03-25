@@ -8,8 +8,8 @@ import type { IAgentFactory } from './IAgentFactory';
 import type { IAgentManager } from './IAgentManager';
 import type { IWorkerTaskManager } from './IWorkerTaskManager';
 import type { BuildConversationOptions, AgentType } from './agentTypes';
-import type { IConversationRepository } from '@process/database/IConversationRepository';
-import type { TChatConversation } from '@/common/storage';
+import type { IConversationRepository } from '@process/services/database/IConversationRepository';
+import type { TChatConversation } from '@/common/config/storage';
 
 export class WorkerTaskManager implements IWorkerTaskManager {
   private taskList: Array<{ id: string; task: IAgentManager }> = [];
@@ -29,7 +29,7 @@ export class WorkerTaskManager implements IWorkerTaskManager {
       if (existing) return existing;
     }
 
-    const conversation = this.repo.getConversation(id);
+    const conversation = await this.repo.getConversation(id);
     if (conversation) return this._buildAndCache(conversation, options);
 
     return Promise.reject(new Error(`Conversation not found: ${id}`));

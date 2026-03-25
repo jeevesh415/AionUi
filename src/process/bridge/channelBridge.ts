@@ -4,15 +4,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { channel } from '@/common/ipcBridge';
-import { getChannelManager } from '@/channels/core/ChannelManager';
-import { getPairingService } from '@/channels/pairing/PairingService';
-import { ExtensionRegistry } from '@/extensions';
-import { toAssetUrl } from '@/extensions/assetProtocol';
+import { channel } from '@/common/adapter/ipcBridge';
+import { getChannelManager } from '@process/channels/core/ChannelManager';
+import { getPairingService } from '@process/channels/pairing/PairingService';
+import { ExtensionRegistry } from '@process/extensions';
+import { toAssetUrl } from '@process/extensions/protocol/assetProtocol';
 import * as path from 'path';
-import type { IChannelPluginStatus, IChannelUser, IChannelPairingRequest, IChannelSession } from '@/channels/types';
-import { hasPluginCredentials } from '@/channels/types';
-import type { IChannelRepository } from '@process/database/IChannelRepository';
+import type {
+  IChannelPluginStatus,
+  IChannelUser,
+  IChannelPairingRequest,
+  IChannelSession,
+} from '@process/channels/types';
+import { hasPluginCredentials } from '@process/channels/types';
+import type { IChannelRepository } from '@process/services/database/IChannelRepository';
 
 /**
  * Initialize Channel IPC Bridge
@@ -30,9 +35,9 @@ export function initChannelBridge(channelRepo: IChannelRepository): void {
     try {
       const BUILTIN_TYPES = new Set(['telegram', 'lark', 'dingtalk', 'slack', 'discord']);
 
-      let dbPlugins: import('@/channels/types').IChannelPluginConfig[] = [];
+      let dbPlugins: import('@process/channels/types').IChannelPluginConfig[] = [];
       try {
-        dbPlugins = channelRepo.getChannelPlugins();
+        dbPlugins = await channelRepo.getChannelPlugins();
       } catch (dbError) {
         console.warn('[ChannelBridge] getChannelPlugins failed, proceeding with builtin-only list:', dbError);
       }
@@ -221,7 +226,7 @@ export function initChannelBridge(channelRepo: IChannelRepository): void {
    */
   channel.getPendingPairings.provider(async () => {
     try {
-      const data = channelRepo.getPendingPairingRequests();
+      const data = await channelRepo.getPendingPairingRequests();
       return { success: true, data };
     } catch (error: any) {
       console.error('[ChannelBridge] getPendingPairings error:', error);
@@ -278,7 +283,7 @@ export function initChannelBridge(channelRepo: IChannelRepository): void {
    */
   channel.getAuthorizedUsers.provider(async () => {
     try {
-      const data = channelRepo.getChannelUsers();
+      const data = await channelRepo.getChannelUsers();
       return { success: true, data };
     } catch (error: any) {
       console.error('[ChannelBridge] getAuthorizedUsers error:', error);
@@ -292,7 +297,7 @@ export function initChannelBridge(channelRepo: IChannelRepository): void {
   channel.revokeUser.provider(async ({ userId }) => {
     try {
       // Delete user (cascades to sessions)
-      channelRepo.deleteChannelUser(userId);
+      await channelRepo.deleteChannelUser(userId);
       console.log(`[ChannelBridge] Revoked user ${userId}`);
       return { success: true };
     } catch (error: any) {
@@ -308,7 +313,7 @@ export function initChannelBridge(channelRepo: IChannelRepository): void {
    */
   channel.getActiveSessions.provider(async () => {
     try {
-      const data = channelRepo.getChannelSessions();
+      const data = await channelRepo.getChannelSessions();
       return { success: true, data };
     } catch (error: any) {
       console.error('[ChannelBridge] getActiveSessions error:', error);

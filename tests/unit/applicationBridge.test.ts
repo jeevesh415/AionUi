@@ -33,8 +33,10 @@ describe('applicationBridge CDP functionality', () => {
       app: {
         isPackaged: false,
         setName: vi.fn(),
+        setPath: vi.fn(),
         getPath: vi.fn((name: string) => {
           if (name === 'userData') return '/mock/userData';
+          if (name === 'appData') return '/mock/appData';
           return '/mock/path';
         }),
         commandLine: {
@@ -71,7 +73,7 @@ describe('applicationBridge CDP functionality', () => {
     }));
 
     // Mock initStorage
-    vi.doMock('@/process/initStorage', () => ({
+    vi.doMock('@process/utils/initStorage', () => ({
       getSystemDir: vi.fn(() => ({
         cacheDir: '/mock/cache',
         workDir: '/mock/work',
@@ -97,13 +99,13 @@ describe('applicationBridge CDP functionality', () => {
     vi.doUnmock('http');
     vi.doUnmock('@/process/WorkerManage');
     vi.doUnmock('@/process/utils/zoom');
-    vi.doUnmock('@/process/initStorage');
+    vi.doUnmock('@process/utils/initStorage');
     vi.doUnmock('@/process/utils');
   });
 
   describe('initApplicationBridge', () => {
     it('should initialize without errors', async () => {
-      const { initApplicationBridge } = await import('@/process/bridge/applicationBridge');
+      const { initApplicationBridge } = await import('@process/bridge/applicationBridge');
 
       const taskMgr = makeTaskManager();
       expect(() => initApplicationBridge(taskMgr)).not.toThrow();
@@ -112,11 +114,27 @@ describe('applicationBridge CDP functionality', () => {
 
   describe('CDP IPC handlers', () => {
     it('should register getCdpStatus handler', async () => {
-      const mod = await import('@/process/bridge/applicationBridge');
+      const mod = await import('@process/bridge/applicationBridge');
       expect(mod.initApplicationBridge).toBeTypeOf('function');
     });
   });
 });
+
+function mockElectronApp(extra?: Record<string, any>) {
+  return {
+    app: {
+      isPackaged: false,
+      setName: vi.fn(),
+      setPath: vi.fn(),
+      getPath: vi.fn((name: string) => {
+        if (name === 'appData') return '/mock/appData';
+        return '/mock/userData';
+      }),
+      commandLine: { appendSwitch: vi.fn() },
+      ...extra,
+    },
+  };
+}
 
 describe('CDP configuration functions', () => {
   const originalEnv = { ...process.env };
@@ -133,14 +151,7 @@ describe('CDP configuration functions', () => {
   });
 
   it('should provide getCdpStatus function', async () => {
-    vi.doMock('electron', () => ({
-      app: {
-        isPackaged: false,
-        setName: vi.fn(),
-        getPath: vi.fn(() => '/mock/userData'),
-        commandLine: { appendSwitch: vi.fn() },
-      },
-    }));
+    vi.doMock('electron', () => mockElectronApp());
 
     vi.doMock('fs', () => ({
       existsSync: vi.fn(() => false),
@@ -152,7 +163,7 @@ describe('CDP configuration functions', () => {
       default: { get: vi.fn() },
     }));
 
-    const { getCdpStatus } = await import('@/utils/configureChromium');
+    const { getCdpStatus } = await import('@process/utils/configureChromium');
 
     const status = getCdpStatus();
 
@@ -165,14 +176,7 @@ describe('CDP configuration functions', () => {
   });
 
   it('should provide updateCdpConfig function', async () => {
-    vi.doMock('electron', () => ({
-      app: {
-        isPackaged: false,
-        setName: vi.fn(),
-        getPath: vi.fn(() => '/mock/userData'),
-        commandLine: { appendSwitch: vi.fn() },
-      },
-    }));
+    vi.doMock('electron', () => mockElectronApp());
 
     vi.doMock('fs', () => ({
       existsSync: vi.fn(() => false),
@@ -184,7 +188,7 @@ describe('CDP configuration functions', () => {
       default: { get: vi.fn() },
     }));
 
-    const { updateCdpConfig } = await import('@/utils/configureChromium');
+    const { updateCdpConfig } = await import('@process/utils/configureChromium');
 
     const result = updateCdpConfig({ enabled: true, port: 9225 });
 
@@ -195,14 +199,7 @@ describe('CDP configuration functions', () => {
   it('should provide saveCdpConfig function', async () => {
     const mockWriteFileSync = vi.fn();
 
-    vi.doMock('electron', () => ({
-      app: {
-        isPackaged: false,
-        setName: vi.fn(),
-        getPath: vi.fn(() => '/mock/userData'),
-        commandLine: { appendSwitch: vi.fn() },
-      },
-    }));
+    vi.doMock('electron', () => mockElectronApp());
 
     vi.doMock('fs', () => ({
       existsSync: vi.fn(() => false),
@@ -214,7 +211,7 @@ describe('CDP configuration functions', () => {
       default: { get: vi.fn() },
     }));
 
-    const { saveCdpConfig } = await import('@/utils/configureChromium');
+    const { saveCdpConfig } = await import('@process/utils/configureChromium');
 
     saveCdpConfig({ enabled: false });
 
@@ -224,16 +221,7 @@ describe('CDP configuration functions', () => {
   it('restart handler calls workerTaskManager.clear() via injected dependency', async () => {
     // Capture handlers using hoisted provider mock
     const capturedHandlers: Record<string, (...args: any[]) => any> = {};
-    vi.doMock('electron', () => ({
-      app: {
-        isPackaged: false,
-        setName: vi.fn(),
-        getPath: vi.fn(() => '/tmp'),
-        commandLine: { appendSwitch: vi.fn() },
-        relaunch: vi.fn(),
-        exit: vi.fn(),
-      },
-    }));
+    vi.doMock('electron', () => mockElectronApp({ relaunch: vi.fn(), exit: vi.fn() }));
     vi.doMock('../../src/common', () => ({
       ipcBridge: {
         application: {
@@ -257,6 +245,20 @@ describe('CDP configuration functions', () => {
       },
     }));
 
+    vi.doMock('@process/utils/initStorage', () => ({
+      getSystemDir: vi.fn(() => ({
+        cacheDir: '/mock/cache',
+        workDir: '/mock/work',
+        platform: 'win32',
+        arch: 'x64',
+      })),
+      ProcessEnv: { set: vi.fn() },
+    }));
+
+    vi.doMock('@process/utils', () => ({
+      copyDirectoryRecursively: vi.fn(),
+    }));
+
     vi.resetModules();
     const { initApplicationBridge } = await import('../../src/process/bridge/applicationBridge');
     const taskMgr = makeTaskManager();
@@ -268,14 +270,7 @@ describe('CDP configuration functions', () => {
   });
 
   it('should provide unregisterInstance function', async () => {
-    vi.doMock('electron', () => ({
-      app: {
-        isPackaged: false,
-        setName: vi.fn(),
-        getPath: vi.fn(() => '/mock/userData'),
-        commandLine: { appendSwitch: vi.fn() },
-      },
-    }));
+    vi.doMock('electron', () => mockElectronApp());
 
     vi.doMock('fs', () => ({
       existsSync: vi.fn(() => false),
@@ -287,7 +282,7 @@ describe('CDP configuration functions', () => {
       default: { get: vi.fn() },
     }));
 
-    const { unregisterInstance } = await import('@/utils/configureChromium');
+    const { unregisterInstance } = await import('@process/utils/configureChromium');
 
     // Should not throw
     expect(() => unregisterInstance()).not.toThrow();
