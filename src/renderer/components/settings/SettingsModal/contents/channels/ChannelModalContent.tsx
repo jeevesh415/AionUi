@@ -14,7 +14,7 @@ import type { GeminiModelSelection } from '@/renderer/pages/conversation/platfor
 import { useGeminiModelSelection } from '@/renderer/pages/conversation/platforms/gemini/useGeminiModelSelection';
 import { Input, InputNumber, Message, Select, Switch } from '@arco-design/web-react';
 import { CheckOne } from '@icon-park/react';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSettingsViewMode } from '../../settingsViewContext';
 import ChannelItem from './ChannelItem';
@@ -22,11 +22,13 @@ import type { ChannelConfig } from './types';
 import DingTalkConfigForm from './DingTalkConfigForm';
 import LarkConfigForm from './LarkConfigForm';
 import TelegramConfigForm from './TelegramConfigForm';
+import WeixinConfigForm from './WeixinConfigForm';
 
 type ChannelModelConfigKey =
   | 'assistant.telegram.defaultModel'
   | 'assistant.lark.defaultModel'
-  | 'assistant.dingtalk.defaultModel';
+  | 'assistant.dingtalk.defaultModel'
+  | 'assistant.weixin.defaultModel';
 
 type ExtensionFieldType = 'text' | 'password' | 'select' | 'number' | 'boolean';
 
@@ -41,7 +43,7 @@ type ExtensionFieldSchema = {
 
 type ExtensionFieldValues = Record<string, Record<string, string | number | boolean>>;
 
-const BUILTIN_CHANNEL_TYPES = new Set(['telegram', 'lark', 'dingtalk', 'slack', 'discord']);
+const BUILTIN_CHANNEL_TYPES = new Set(['telegram', 'lark', 'dingtalk', 'weixin', 'slack', 'discord']);
 
 /**
  * Internal hook: wraps useGeminiModelSelection with ConfigStorage persistence
@@ -60,6 +62,12 @@ const useChannelModelSelection = (configKey: ChannelModelConfigKey): GeminiModel
   const { providers } = useModelProviderList();
   const [resolvedInitialModel, setResolvedInitialModel] = useState<TProviderWithModel | undefined>(undefined);
   const [restored, setRestored] = useState(false);
+  const retryCountRef = useRef(0);
+
+  // Cap retries to prevent infinite re-runs when a saved provider ID is stale
+  // (e.g. provider deleted, or agent switched to a non-gemini backend like iflow).
+  // The Google Auth provider typically loads within 1-2 SWR cycles, so 5 is generous.
+  const MAX_RESTORE_RETRIES = 5;
 
   useEffect(() => {
     if (restored || providers.length === 0) return;
@@ -75,7 +83,11 @@ const useChannelModelSelection = (configKey: ChannelModelConfigKey): GeminiModel
 
         const provider = providers.find((p) => p.id === saved.id);
         if (!provider) {
-          // Provider not found in current list — don't mark as restored.
+          retryCountRef.current += 1;
+          if (retryCountRef.current >= MAX_RESTORE_RETRIES) {
+            // Provider is permanently missing — give up to avoid infinite retries
+            setRestored(true);
+          }
           // The Google Auth provider may load after API-key providers;
           // leaving restored=false lets this effect re-run when providers update.
           return;
@@ -112,13 +124,18 @@ const useChannelModelSelection = (configKey: ChannelModelConfigKey): GeminiModel
         const platform = configKey.replace('assistant.', '').replace('.defaultModel', '') as
           | 'telegram'
           | 'lark'
-          | 'dingtalk';
+          | 'dingtalk'
+          | 'weixin';
         const agentKey = `assistant.${platform}.agent` as const;
         const currentAgent = await ConfigStorage.get(agentKey);
         await channel.syncChannelSettings
           .invoke({
             platform,
-            agent: (currentAgent as { backend: string; customAgentId?: string; name?: string }) || {
+            agent: (currentAgent as {
+              backend: string;
+              customAgentId?: string;
+              name?: string;
+            }) || {
               backend: 'gemini',
             },
             model: modelRef,
@@ -136,7 +153,10 @@ const useChannelModelSelection = (configKey: ChannelModelConfigKey): GeminiModel
     [configKey, t]
   );
 
-  return useGeminiModelSelection({ initialModel: resolvedInitialModel, onSelectModel });
+  return useGeminiModelSelection({
+    initialModel: resolvedInitialModel,
+    onSelectModel,
+  });
 };
 
 /**
@@ -151,9 +171,11 @@ const ChannelModalContent: React.FC = () => {
   const [pluginStatus, setPluginStatus] = useState<IChannelPluginStatus | null>(null);
   const [larkPluginStatus, setLarkPluginStatus] = useState<IChannelPluginStatus | null>(null);
   const [dingtalkPluginStatus, setDingtalkPluginStatus] = useState<IChannelPluginStatus | null>(null);
+  const [weixinPluginStatus, setWeixinPluginStatus] = useState<IChannelPluginStatus | null>(null);
   const [enableLoading, setEnableLoading] = useState(false);
   const [larkEnableLoading, setLarkEnableLoading] = useState(false);
   const [dingtalkEnableLoading, setDingtalkEnableLoading] = useState(false);
+  const [weixinEnableLoading, setWeixinEnableLoading] = useState(false);
   const [extensionStatuses, setExtensionStatuses] = useState<Record<string, IChannelPluginStatus>>({});
   const [extensionLoadingMap, setExtensionLoadingMap] = useState<Record<string, boolean>>({});
   const [extensionFieldValues, setExtensionFieldValues] = useState<ExtensionFieldValues>({});
@@ -169,12 +191,14 @@ const ChannelModalContent: React.FC = () => {
     discord: true,
     lark: true,
     dingtalk: true,
+    weixin: true,
   });
 
   // Model selection state — uses unified hook with ConfigStorage persistence
   const telegramModelSelection = useChannelModelSelection('assistant.telegram.defaultModel');
   const larkModelSelection = useChannelModelSelection('assistant.lark.defaultModel');
   const dingtalkModelSelection = useChannelModelSelection('assistant.dingtalk.defaultModel');
+  const weixinModelSelection = useChannelModelSelection('assistant.weixin.defaultModel');
 
   // Load plugin status
   const loadPluginStatus = useCallback(async () => {
@@ -184,11 +208,13 @@ const ChannelModalContent: React.FC = () => {
         const telegramPlugin = result.data.find((p) => p.type === 'telegram');
         const larkPlugin = result.data.find((p) => p.type === 'lark');
         const dingtalkPlugin = result.data.find((p) => p.type === 'dingtalk');
+        const weixinPlugin = result.data.find((p) => p.type === 'weixin');
         const extensionPlugins = result.data.filter((p) => !BUILTIN_CHANNEL_TYPES.has(p.type));
 
         setPluginStatus(telegramPlugin || null);
         setLarkPluginStatus(larkPlugin || null);
         setDingtalkPluginStatus(dingtalkPlugin || null);
+        setWeixinPluginStatus(weixinPlugin || null);
         setExtensionStatuses(() => {
           const next: Record<string, IChannelPluginStatus> = {};
           for (const plugin of extensionPlugins) {
@@ -249,6 +275,8 @@ const ChannelModalContent: React.FC = () => {
         setLarkPluginStatus(status);
       } else if (status.type === 'dingtalk') {
         setDingtalkPluginStatus(status);
+      } else if (status.type === 'weixin') {
+        setWeixinPluginStatus(status);
       } else if (!BUILTIN_CHANNEL_TYPES.has(status.type)) {
         setExtensionStatuses((prev) => ({
           ...prev,
@@ -296,7 +324,9 @@ const ChannelModalContent: React.FC = () => {
           Message.error(result.msg || t('settings.assistant.enableFailed', 'Failed to enable plugin'));
         }
       } else {
-        const result = await channel.disablePlugin.invoke({ pluginId: 'telegram_default' });
+        const result = await channel.disablePlugin.invoke({
+          pluginId: 'telegram_default',
+        });
 
         if (result.success) {
           Message.success(t('settings.assistant.pluginDisabled', 'Telegram bot disabled'));
@@ -336,7 +366,9 @@ const ChannelModalContent: React.FC = () => {
           Message.error(result.msg || t('settings.lark.enableFailed', 'Failed to enable Lark plugin'));
         }
       } else {
-        const result = await channel.disablePlugin.invoke({ pluginId: 'lark_default' });
+        const result = await channel.disablePlugin.invoke({
+          pluginId: 'lark_default',
+        });
 
         if (result.success) {
           Message.success(t('settings.lark.pluginDisabled', 'Lark bot disabled'));
@@ -375,7 +407,9 @@ const ChannelModalContent: React.FC = () => {
           Message.error(result.msg || t('settings.dingtalk.enableFailed', 'Failed to enable DingTalk plugin'));
         }
       } else {
-        const result = await channel.disablePlugin.invoke({ pluginId: 'dingtalk_default' });
+        const result = await channel.disablePlugin.invoke({
+          pluginId: 'dingtalk_default',
+        });
 
         if (result.success) {
           Message.success(t('settings.dingtalk.pluginDisabled', 'DingTalk bot disabled'));
@@ -388,6 +422,44 @@ const ChannelModalContent: React.FC = () => {
       Message.error(error.message);
     } finally {
       setDingtalkEnableLoading(false);
+    }
+  };
+
+  // Enable/Disable WeChat plugin
+  const handleToggleWeixinPlugin = async (enabled: boolean) => {
+    setWeixinEnableLoading(true);
+    try {
+      if (enabled) {
+        if (!weixinPluginStatus?.hasToken) {
+          Message.warning(t('settings.weixin.loginRequired', 'Please login with WeChat QR code first'));
+          setWeixinEnableLoading(false);
+          return;
+        }
+        const result = await channel.enablePlugin.invoke({
+          pluginId: 'weixin_default',
+          config: {},
+        });
+        if (result.success) {
+          Message.success(t('settings.weixin.pluginEnabled', 'WeChat channel enabled'));
+          await loadPluginStatus();
+        } else {
+          Message.error(result.msg || t('settings.weixin.enableFailed', 'Failed to enable WeChat plugin'));
+        }
+      } else {
+        const result = await channel.disablePlugin.invoke({
+          pluginId: 'weixin_default',
+        });
+        if (result.success) {
+          Message.success(t('settings.weixin.pluginDisabled', 'WeChat channel disabled'));
+          await loadPluginStatus();
+        } else {
+          Message.error(result.msg || t('settings.weixin.disableFailed', 'Failed to disable WeChat plugin'));
+        }
+      }
+    } catch (error: any) {
+      Message.error(error.message);
+    } finally {
+      setWeixinEnableLoading(false);
     }
   };
 
@@ -434,22 +506,37 @@ const ChannelModalContent: React.FC = () => {
           });
 
           if (result.success) {
-            Message.success(t('settings.channels.extension.enabled', { defaultValue: 'Channel enabled' }));
-            await loadPluginStatus();
-          } else {
-            Message.error(
-              result.msg || t('settings.channels.extension.enableFailed', { defaultValue: 'Failed to enable channel' })
+            Message.success(
+              t('settings.channels.extension.enabled', {
+                defaultValue: 'Channel enabled',
+              })
             );
-          }
-        } else {
-          const result = await channel.disablePlugin.invoke({ pluginId: status.id || pluginType });
-          if (result.success) {
-            Message.success(t('settings.channels.extension.disabled', { defaultValue: 'Channel disabled' }));
             await loadPluginStatus();
           } else {
             Message.error(
               result.msg ||
-                t('settings.channels.extension.disableFailed', { defaultValue: 'Failed to disable channel' })
+                t('settings.channels.extension.enableFailed', {
+                  defaultValue: 'Failed to enable channel',
+                })
+            );
+          }
+        } else {
+          const result = await channel.disablePlugin.invoke({
+            pluginId: status.id || pluginType,
+          });
+          if (result.success) {
+            Message.success(
+              t('settings.channels.extension.disabled', {
+                defaultValue: 'Channel disabled',
+              })
+            );
+            await loadPluginStatus();
+          } else {
+            Message.error(
+              result.msg ||
+                t('settings.channels.extension.disableFailed', {
+                  defaultValue: 'Failed to disable channel',
+                })
             );
           }
         }
@@ -483,7 +570,9 @@ const ChannelModalContent: React.FC = () => {
         return (
           <div className='text-14px text-t-secondary py-12px'>
             {status.extensionMeta?.description ||
-              t('settings.channels.extension.noConfig', { defaultValue: 'No extra configuration required.' })}
+              t('settings.channels.extension.noConfig', {
+                defaultValue: 'No extra configuration required.',
+              })}
           </div>
         );
       }
@@ -540,7 +629,10 @@ const ChannelModalContent: React.FC = () => {
                   <div className='text-13px text-t-primary'>{label}</div>
                   <Select
                     value={typeof rawValue === 'string' ? rawValue : undefined}
-                    options={(field.options || []).map((option) => ({ label: option, value: option }))}
+                    options={(field.options || []).map((option) => ({
+                      label: option,
+                      value: option,
+                    }))}
                     onChange={(value) => updateExtensionFieldValue(pluginType, field.key, String(value))}
                     placeholder={t('settings.channels.extension.selectPlaceholder', { defaultValue: 'Please select' })}
                     allowClear
@@ -627,6 +719,24 @@ const ChannelModalContent: React.FC = () => {
       ),
     };
 
+    const weixinChannel: ChannelConfig = {
+      id: 'weixin',
+      title: t('settings.channels.weixinTitle', 'WeChat'),
+      description: t('settings.channels.weixinDesc', 'Chat with AionUi assistant via WeChat'),
+      status: 'active',
+      enabled: weixinPluginStatus?.enabled || false,
+      disabled: weixinEnableLoading,
+      isConnected: weixinPluginStatus?.connected || false,
+      defaultModel: weixinModelSelection.currentModel?.useModel,
+      content: (
+        <WeixinConfigForm
+          pluginStatus={weixinPluginStatus}
+          modelSelection={weixinModelSelection}
+          onStatusChange={setWeixinPluginStatus}
+        />
+      ),
+    };
+
     const extensionChannels: ChannelConfig[] = Object.values(extensionStatuses)
       .toSorted((a, b) => a.name.localeCompare(b.name))
       .map((status) => ({
@@ -634,7 +744,9 @@ const ChannelModalContent: React.FC = () => {
         title: status.name,
         description:
           status.extensionMeta?.description ||
-          t('settings.channels.extension.defaultDesc', { defaultValue: 'Extension channel plugin' }),
+          t('settings.channels.extension.defaultDesc', {
+            defaultValue: 'Extension channel plugin',
+          }),
         status: 'active',
         enabled: status.enabled || false,
         disabled: extensionLoadingMap[status.type] || false,
@@ -678,7 +790,7 @@ const ChannelModalContent: React.FC = () => {
       },
     ].filter((channel) => !extensionTypeSet.has(String(channel.id).toLowerCase()));
 
-    return [telegramChannel, larkChannel, dingtalkChannel, ...extensionChannels, ...comingSoonChannels];
+    return [telegramChannel, larkChannel, dingtalkChannel, weixinChannel, ...extensionChannels, ...comingSoonChannels];
   }, [
     pluginStatus,
     larkPluginStatus,
@@ -691,6 +803,9 @@ const ChannelModalContent: React.FC = () => {
     enableLoading,
     larkEnableLoading,
     dingtalkEnableLoading,
+    weixinPluginStatus,
+    weixinEnableLoading,
+    weixinModelSelection,
     renderExtensionConfigForm,
     t,
   ]);
@@ -700,6 +815,7 @@ const ChannelModalContent: React.FC = () => {
     if (channelId === 'telegram') return handleTogglePlugin;
     if (channelId === 'lark') return handleToggleLarkPlugin;
     if (channelId === 'dingtalk') return handleToggleDingtalkPlugin;
+    if (channelId === 'weixin') return handleToggleWeixinPlugin;
     if (extensionStatuses[channelId]) {
       return (enabled: boolean) => {
         void handleToggleExtensionPlugin(channelId, enabled);
@@ -711,8 +827,12 @@ const ChannelModalContent: React.FC = () => {
     defaultValue: 'Connect Telegram, Lark, and DingTalk to interact with AionUi from IM apps.',
   });
   const channelSetupSteps = [
-    t('settings.channels.selectFirst', { defaultValue: 'Select a channel and configure credentials.' }),
-    t('settings.channels.enableAfterConfig', { defaultValue: 'Enable it and start chatting with your AI agent.' }),
+    t('settings.channels.selectFirst', {
+      defaultValue: 'Select a channel and configure credentials.',
+    }),
+    t('settings.channels.enableAfterConfig', {
+      defaultValue: 'Enable it and start chatting with your AI agent.',
+    }),
   ];
 
   return (

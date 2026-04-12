@@ -21,11 +21,16 @@ import type {
   AutoUpdateStatus,
 } from '../update/updateTypes';
 import type { ProtocolDetectionRequest, ProtocolDetectionResponse } from '../utils/protocolDetector';
+import type { SpeechToTextRequest, SpeechToTextResult } from '../types/speech';
 
 export const shell = {
   openFile: bridge.buildProvider<void, string>('open-file'), // 使用系统默认程序打开文件
   showItemInFolder: bridge.buildProvider<void, string>('show-item-in-folder'), // 打开文件夹
   openExternal: bridge.buildProvider<void, string>('open-external'), // 使用系统默认程序打开外部链接
+  checkToolInstalled: bridge.buildProvider<boolean, { tool: string }>('shell.check-tool-installed'), // 检查工具是否安装
+  openFolderWith: bridge.buildProvider<void, { folderPath: string; tool: 'vscode' | 'terminal' | 'explorer' }>(
+    'shell.open-folder-with'
+  ), // 使用指定工具打开文件夹
 };
 
 //通用会话能力
@@ -38,7 +43,8 @@ export const conversation = {
   get: bridge.buildProvider<TChatConversation, { id: string }>('get-conversation'), // 获取对话信息
   getAssociateConversation: bridge.buildProvider<TChatConversation[], { conversation_id: string }>(
     'get-associated-conversation'
-  ), // 获取关联对话
+  ),
+  listByCronJob: bridge.buildProvider<TChatConversation[], { cronJobId: string }>('conversation.list-by-cron-job'), // 获取关联对话
   remove: bridge.buildProvider<boolean, { id: string }>('remove-conversation'), // 删除对话
   update: bridge.buildProvider<boolean, { id: string; updates: Partial<TChatConversation>; mergeExtra?: boolean }>(
     'update-conversation'
@@ -51,6 +57,10 @@ export const conversation = {
     IBridgeResponse<{ commands: SlashCommandItem[] }>,
     { conversation_id: string }
   >('conversation.get-slash-commands'),
+  askSideQuestion: bridge.buildProvider<
+    IBridgeResponse<ConversationSideQuestionResult>,
+    { conversation_id: string; question: string }
+  >('conversation.ask-side-question'),
   confirmMessage: bridge.buildProvider<IBridgeResponse, IConfirmMessageParams>('conversation.confirm.message'), // 通用确认消息
   responseStream: bridge.buildEmitter<IResponseMessage>('chat.response.stream'), // 接收消息（统一接口）
   turnCompleted: bridge.buildEmitter<IConversationTurnCompletedEvent>('conversation.turn.completed'),
@@ -120,6 +130,18 @@ export interface ICdpConfig {
   port?: number;
 }
 
+// Start on boot status interface
+export interface IStartOnBootStatus {
+  /** Whether the current runtime can manage start-on-boot */
+  supported: boolean;
+  /** Whether AionUi is currently configured to launch at login */
+  enabled: boolean;
+  /** Whether the app is running from a packaged build */
+  isPackaged: boolean;
+  /** Current platform name */
+  platform: string;
+}
+
 export const application = {
   restart: bridge.buildProvider<void, void>('restart-app'), // 重启应用
   openDevTools: bridge.buildProvider<boolean, void>('open-dev-tools'), // 打开/关闭开发者工具，返回操作后的状态
@@ -135,6 +157,11 @@ export const application = {
   // CDP (Chrome DevTools Protocol) management
   getCdpStatus: bridge.buildProvider<IBridgeResponse<ICdpStatus>, void>('app.get-cdp-status'), // 获取 CDP 状态
   updateCdpConfig: bridge.buildProvider<IBridgeResponse<ICdpConfig>, Partial<ICdpConfig>>('app.update-cdp-config'), // 更新 CDP 配置
+  // Start on boot management
+  getStartOnBootStatus: bridge.buildProvider<IBridgeResponse<IStartOnBootStatus>, void>('app.get-start-on-boot-status'), // 获取开机启动状态
+  setStartOnBoot: bridge.buildProvider<IBridgeResponse<IStartOnBootStatus>, { enabled: boolean }>(
+    'app.set-start-on-boot'
+  ), // 设置开机启动
   // Bridge Main Process logs to Renderer F12 Console
   logStream: bridge.buildEmitter<{ level: 'log' | 'warn' | 'error'; tag: string; message: string; data?: unknown }>(
     'app.log-stream'
@@ -186,6 +213,7 @@ export const dialog = {
 };
 export const fs = {
   getFilesByDir: bridge.buildProvider<Array<IDirOrFile>, { dir: string; root: string }>('get-file-by-dir'), // 获取指定文件夹下所有文件夹和文件列表
+  listWorkspaceFiles: bridge.buildProvider<Array<IWorkspaceFlatFile>, { root: string }>('list-workspace-files'),
   getImageBase64: bridge.buildProvider<string, { path: string }>('get-image-base64'), // 获取图片base64
   fetchRemoteImage: bridge.buildProvider<string, { url: string }>('fetch-remote-image'), // 远程图片转base64
   readFile: bridge.buildProvider<string, { path: string }>('read-file'), // 读取文件内容（UTF-8）
@@ -289,11 +317,20 @@ export const fs = {
   disableSkillsMarket: bridge.buildProvider<IBridgeResponse, void>('disable-skills-market'),
 };
 
+export const speechToText = {
+  transcribe: bridge.buildProvider<SpeechToTextResult, SpeechToTextRequest>('speech-to-text.transcribe'),
+};
+
 export const fileWatch = {
   startWatch: bridge.buildProvider<IBridgeResponse, { filePath: string }>('file-watch-start'), // 开始监听文件变化
   stopWatch: bridge.buildProvider<IBridgeResponse, { filePath: string }>('file-watch-stop'), // 停止监听文件变化
   stopAllWatches: bridge.buildProvider<IBridgeResponse, void>('file-watch-stop-all'), // 停止所有文件监听
   fileChanged: bridge.buildEmitter<{ filePath: string; eventType: string }>('file-changed'), // 文件变化事件
+};
+
+// 工作空间 Office 文件扫描（检测当前存在的 .pptx/.docx/.xlsx）/ Workspace office file scan
+export const workspaceOfficeWatch = {
+  scan: bridge.buildProvider<string[], { workspace: string }>('workspace-office-watch-scan'),
 };
 
 // 文件流式更新（Agent 写入文件时实时推送内容）/ File streaming updates (real-time content push when agent writes)
@@ -305,6 +342,36 @@ export const fileStream = {
     relativePath: string; // 相对路径 / Relative path
     operation: 'write' | 'delete'; // 操作类型 / Operation type
   }>('file-stream-content-update'), // Agent 写入文件时的流式内容更新 / Streaming content update when agent writes file
+};
+
+// File snapshot providers for tracking file changes
+export const fileSnapshot = {
+  init: bridge.buildProvider<import('@/common/types/fileSnapshot').SnapshotInfo, { workspace: string }>(
+    'file-snapshot-init'
+  ),
+  compare: bridge.buildProvider<import('@/common/types/fileSnapshot').CompareResult, { workspace: string }>(
+    'file-snapshot-compare'
+  ),
+  getBaselineContent: bridge.buildProvider<string | null, { workspace: string; filePath: string }>(
+    'file-snapshot-baseline'
+  ),
+  getInfo: bridge.buildProvider<import('@/common/types/fileSnapshot').SnapshotInfo, { workspace: string }>(
+    'file-snapshot-info'
+  ),
+  dispose: bridge.buildProvider<void, { workspace: string }>('file-snapshot-dispose'),
+  stageFile: bridge.buildProvider<void, { workspace: string; filePath: string }>('file-snapshot-stage-file'),
+  stageAll: bridge.buildProvider<void, { workspace: string }>('file-snapshot-stage-all'),
+  unstageFile: bridge.buildProvider<void, { workspace: string; filePath: string }>('file-snapshot-unstage-file'),
+  unstageAll: bridge.buildProvider<void, { workspace: string }>('file-snapshot-unstage-all'),
+  discardFile: bridge.buildProvider<
+    void,
+    { workspace: string; filePath: string; operation: import('@/common/types/fileSnapshot').FileChangeOperation }
+  >('file-snapshot-discard-file'),
+  resetFile: bridge.buildProvider<
+    void,
+    { workspace: string; filePath: string; operation: import('@/common/types/fileSnapshot').FileChangeOperation }
+  >('file-snapshot-reset-file'),
+  getBranches: bridge.buildProvider<string[], { workspace: string }>('file-snapshot-get-branches'),
 };
 
 export const googleAuth = {
@@ -390,6 +457,10 @@ export const acpConversation = {
   >('acp.get-available-agents'),
   checkEnv: bridge.buildProvider<{ env: Record<string, string> }, void>('acp.check.env'),
   refreshCustomAgents: bridge.buildProvider<IBridgeResponse, void>('acp.refresh-custom-agents'),
+  testCustomAgent: bridge.buildProvider<
+    IBridgeResponse<{ step: 'cli_check' | 'acp_initialize'; error?: string }>,
+    { command: string; acpArgs?: string[]; env?: Record<string, string> }
+  >('acp.test-custom-agent'),
   checkAgentHealth: bridge.buildProvider<
     IBridgeResponse<{ available: boolean; latency?: number; error?: string }>,
     { backend: AcpBackend }
@@ -443,7 +514,7 @@ export const mcpService = {
   testMcpConnection: bridge.buildProvider<
     IBridgeResponse<{
       success: boolean;
-      tools?: Array<{ name: string; description?: string }>;
+      tools?: Array<{ name: string; description?: string; _meta?: Record<string, unknown> }>;
       error?: string;
       needsAuth?: boolean;
       authMethod?: 'oauth' | 'basic';
@@ -510,6 +581,30 @@ export const openclawConversation = {
   >('openclaw.get-runtime'),
 };
 
+// Remote Agent configuration CRUD
+export const remoteAgent = {
+  list: bridge.buildProvider<import('@process/agent/remote/types').RemoteAgentConfig[], void>('remote-agent.list'),
+  get: bridge.buildProvider<import('@process/agent/remote/types').RemoteAgentConfig | null, { id: string }>(
+    'remote-agent.get'
+  ),
+  create: bridge.buildProvider<
+    import('@process/agent/remote/types').RemoteAgentConfig,
+    import('@process/agent/remote/types').RemoteAgentInput
+  >('remote-agent.create'),
+  update: bridge.buildProvider<
+    boolean,
+    { id: string; updates: Partial<import('@process/agent/remote/types').RemoteAgentInput> }
+  >('remote-agent.update'),
+  delete: bridge.buildProvider<boolean, { id: string }>('remote-agent.delete'),
+  testConnection: bridge.buildProvider<
+    { success: boolean; error?: string },
+    { url: string; authType: string; authToken?: string; allowInsecure?: boolean }
+  >('remote-agent.test-connection'),
+  handshake: bridge.buildProvider<{ status: 'ok' | 'pending_approval' | 'error'; error?: string }, { id: string }>(
+    'remote-agent.handshake'
+  ),
+};
+
 // Database operations
 export const database = {
   getConversationMessages: bridge.buildProvider<
@@ -566,6 +661,24 @@ export const pptPreview = {
   ),
 };
 
+// Word preview via officecli watch
+export const wordPreview = {
+  start: bridge.buildProvider<{ url: string }, { filePath: string }>('word-preview.start'),
+  stop: bridge.buildProvider<void, { filePath: string }>('word-preview.stop'),
+  status: bridge.buildEmitter<{ state: 'starting' | 'installing' | 'ready' | 'error'; message?: string }>(
+    'word-preview.status'
+  ),
+};
+
+// Excel preview via officecli watch
+export const excelPreview = {
+  start: bridge.buildProvider<{ url: string }, { filePath: string }>('excel-preview.start'),
+  stop: bridge.buildProvider<void, { filePath: string }>('excel-preview.stop'),
+  status: bridge.buildEmitter<{ state: 'starting' | 'installing' | 'ready' | 'error'; message?: string }>(
+    'excel-preview.status'
+  ),
+};
+
 // Deep link protocol handling / 深度链接协议处理
 export const deepLink = {
   /** Emitted when app is opened via aionui:// protocol URL */
@@ -595,9 +708,30 @@ export const systemSettings = {
   setCronNotificationEnabled: bridge.buildProvider<void, { enabled: boolean }>(
     'system-settings:set-cron-notification-enabled'
   ),
+  getKeepAwake: bridge.buildProvider<boolean, void>('system-settings:get-keep-awake'),
+  setKeepAwake: bridge.buildProvider<void, { enabled: boolean }>('system-settings:set-keep-awake'),
   changeLanguage: bridge.buildProvider<void, { language: string }>('system-settings:change-language'),
   // Broadcast language change to all renderers (desktop + WebUI) for real-time sync
   languageChanged: bridge.buildEmitter<{ language: string }>('system-settings:language-changed'),
+  getSaveUploadToWorkspace: bridge.buildProvider<boolean, void>('system-settings:get-save-upload-to-workspace'),
+  setSaveUploadToWorkspace: bridge.buildProvider<void, { enabled: boolean }>(
+    'system-settings:set-save-upload-to-workspace'
+  ),
+  getAutoPreviewOfficeFiles: bridge.buildProvider<boolean, void>('system-settings:get-auto-preview-office-files'),
+  setAutoPreviewOfficeFiles: bridge.buildProvider<void, { enabled: boolean }>(
+    'system-settings:set-auto-preview-office-files'
+  ),
+  // Desktop pet settings
+  getPetEnabled: bridge.buildProvider<boolean, void>('system-settings:get-pet-enabled'),
+  setPetEnabled: bridge.buildProvider<void, { enabled: boolean }>('system-settings:set-pet-enabled'),
+  getPetSize: bridge.buildProvider<number, void>('system-settings:get-pet-size'),
+  setPetSize: bridge.buildProvider<void, { size: number }>('system-settings:set-pet-size'),
+  getPetDnd: bridge.buildProvider<boolean, void>('system-settings:get-pet-dnd'),
+  setPetDnd: bridge.buildProvider<void, { dnd: boolean }>('system-settings:set-pet-dnd'),
+  getPetConfirmEnabled: bridge.buildProvider<boolean, void>('system-settings:get-pet-confirm-enabled'),
+  setPetConfirmEnabled: bridge.buildProvider<void, { enabled: boolean }>('system-settings:set-pet-confirm-enabled'),
+  getCommandQueueEnabled: bridge.buildProvider<boolean, void>('system-settings:get-command-queue-enabled'),
+  setCommandQueueEnabled: bridge.buildProvider<void, { enabled: boolean }>('system-settings:set-command-queue-enabled'),
 };
 
 // 系统通知接口 / System notification API
@@ -678,6 +812,9 @@ export const cron = {
   addJob: bridge.buildProvider<ICronJob, ICreateCronJobParams>('cron.add-job'),
   updateJob: bridge.buildProvider<ICronJob, { jobId: string; updates: Partial<ICronJob> }>('cron.update-job'),
   removeJob: bridge.buildProvider<void, { jobId: string }>('cron.remove-job'),
+  runNow: bridge.buildProvider<{ conversationId: string }, { jobId: string }>('cron.run-now'),
+  saveSkill: bridge.buildProvider<void, { jobId: string; content: string }>('cron.save-skill'),
+  hasSkill: bridge.buildProvider<boolean, { jobId: string }>('cron.has-skill'),
   // Events
   onJobCreated: bridge.buildEmitter<ICronJob>('cron.job-created'),
   onJobUpdated: bridge.buildEmitter<ICronJob>('cron.job-updated'),
@@ -698,7 +835,10 @@ export interface ICronJob {
   name: string;
   enabled: boolean;
   schedule: ICronSchedule;
-  target: { payload: { kind: 'message'; text: string } };
+  target: {
+    payload: { kind: 'message'; text: string };
+    executionMode?: 'existing' | 'new_conversation';
+  };
   metadata: {
     conversationId: string;
     conversationTitle?: string;
@@ -706,6 +846,7 @@ export interface ICronJob {
     createdBy: 'user' | 'agent';
     createdAt: number;
     updatedAt: number;
+    agentConfig?: ICronAgentConfig;
   };
   state: {
     nextRunAtMs?: number;
@@ -718,14 +859,32 @@ export interface ICronJob {
   };
 }
 
+export interface ICronAgentConfig {
+  backend: AcpBackendAll;
+  name: string;
+  cliPath?: string;
+  isPreset?: boolean;
+  customAgentId?: string;
+  presetAgentType?: string;
+  mode?: string;
+  modelId?: string;
+  configOptions?: Record<string, string>;
+  workspace?: string;
+}
+
 export interface ICreateCronJobParams {
   name: string;
+  description?: string;
   schedule: ICronSchedule;
-  message: string;
+  /** New UI system uses `prompt`; old skill system uses `message` */
+  prompt?: string;
+  message?: string;
   conversationId: string;
   conversationTitle?: string;
   agentType: AcpBackendAll;
   createdBy: 'user' | 'agent';
+  executionMode?: 'existing' | 'new_conversation';
+  agentConfig?: ICronAgentConfig;
 }
 
 interface ISendMessageParams {
@@ -747,7 +906,7 @@ export interface IConfirmMessageParams {
 }
 
 export interface ICreateConversationParams {
-  type: 'gemini' | 'acp' | 'codex' | 'openclaw-gateway' | 'nanobot';
+  type: 'gemini' | 'acp' | 'codex' | 'openclaw-gateway' | 'nanobot' | 'remote' | 'aionrs';
   id?: string;
   name?: string;
   model: TProviderWithModel;
@@ -781,6 +940,10 @@ export interface ICreateConversationParams {
     codexModel?: string;
     /** Pre-selected ACP model from Guid page (cached model list) */
     currentModelId?: string;
+    /** Cached config options from Guid page for immediate display in conversation */
+    cachedConfigOptions?: import('../types/acpTypes').AcpSessionConfigOption[];
+    /** Pending config option selections from Guid page (applied after session creation) */
+    pendingConfigOptions?: Record<string, string>;
     /** Runtime validation snapshot used for post-switch strong checks (OpenClaw) */
     runtimeValidation?: {
       expectedWorkspace?: string;
@@ -793,6 +956,14 @@ export interface ICreateConversationParams {
     };
     /** Explicit marker for temporary health-check conversations */
     isHealthCheck?: boolean;
+    /** Remote agent config ID (FK to remote_agents table) — required when type='remote' */
+    remoteAgentId?: string;
+    /** Extra skill directory paths to symlink into workspace (e.g. cron job skill dirs) */
+    extraSkillPaths?: string[];
+    /** Builtin skill names to exclude from auto-injection (e.g. 'cron' for cron-spawned conversations) */
+    excludeBuiltinSkills?: string[];
+    /** Team ownership — conversations with teamId are hidden from the sidebar */
+    teamId?: string;
   };
 }
 interface IResetConversationParams {
@@ -822,11 +993,18 @@ export interface IFileMetadata {
   isDirectory?: boolean;
 }
 
+export type IWorkspaceFlatFile = {
+  name: string;
+  fullPath: string;
+  relativePath: string;
+};
+
 export interface IResponseMessage {
   type: string;
   data: unknown;
   msg_id: string;
   conversation_id: string;
+  hidden?: boolean;
 }
 
 export interface IConversationTurnCompletedEvent {
@@ -869,6 +1047,26 @@ export interface IConversationListChangedEvent {
   action: 'created' | 'updated' | 'deleted';
   source?: string;
 }
+
+export type ConversationSideQuestionResult =
+  | {
+      status: 'ok';
+      answer: string;
+    }
+  | {
+      status: 'noAnswer';
+    }
+  | {
+      status: 'unsupported';
+    }
+  | {
+      status: 'invalid';
+      reason: 'emptyQuestion';
+    }
+  | {
+      status: 'toolsRequired';
+    };
+
 interface IBridgeResponse<D = {}> {
   success: boolean;
   data?: D;
@@ -1047,4 +1245,63 @@ export const channel = {
     'channel.plugin-status-changed'
   ),
   userAuthorized: bridge.buildEmitter<IChannelUser>('channel.user-authorized'),
+};
+
+// ==================== Agent Hub API ====================
+import type { IHubAgentItem, HubExtensionStatus } from '@/common/types/hub';
+
+export const hub = {
+  // 获取 Hub 弹窗的 extension 列表 / Get extension list for Hub Modal
+  getExtensionList: bridge.buildProvider<IBridgeResponse<IHubAgentItem[]>, void>('hub.get-extension-list'),
+  // 发起安装 / Install extension
+  install: bridge.buildProvider<IBridgeResponse, { name: string }>('hub.install'),
+  // 发起卸载 / Uninstall extension (optional in P0)
+  uninstall: bridge.buildProvider<IBridgeResponse, { name: string }>('hub.uninstall'),
+  // 发起重试安装 / Retry install
+  retryInstall: bridge.buildProvider<IBridgeResponse, { name: string }>('hub.retry-install'),
+  // 检查可更新的 extension / Check updates for installed extensions
+  checkUpdates: bridge.buildProvider<IBridgeResponse<{ name: string }[]>, void>('hub.check-updates'),
+  // 发起更新 / Update extension
+  update: bridge.buildProvider<IBridgeResponse, { name: string }>('hub.update'),
+  // 安装/卸载状态变更推送 / State changed event for extension
+  onStateChanged: bridge.buildEmitter<{ name: string; status: HubExtensionStatus; error?: string }>(
+    'hub.state-changed'
+  ),
+};
+// Team Mode API
+export type ICreateTeamParams = {
+  userId: string;
+  name: string;
+  workspace: string;
+  workspaceMode: 'shared' | 'isolated';
+  agents: import('@process/team/types').TeamAgent[];
+};
+
+export type IAddTeamAgentParams = {
+  teamId: string;
+  agent: Omit<import('@process/team/types').TeamAgent, 'slotId'>;
+};
+
+export const team = {
+  create: bridge.buildProvider<import('@process/team/types').TTeam, ICreateTeamParams>('team.create'),
+  list: bridge.buildProvider<import('@process/team/types').TTeam[], { userId: string }>('team.list'),
+  get: bridge.buildProvider<import('@process/team/types').TTeam | null, { id: string }>('team.get'),
+  remove: bridge.buildProvider<void, { id: string }>('team.remove'),
+  addAgent: bridge.buildProvider<import('@process/team/types').TeamAgent, IAddTeamAgentParams>('team.add-agent'),
+  removeAgent: bridge.buildProvider<void, { teamId: string; slotId: string }>('team.remove-agent'),
+  sendMessage: bridge.buildProvider<void, { teamId: string; content: string }>('team.send-message'),
+  sendMessageToAgent: bridge.buildProvider<void, { teamId: string; slotId: string; content: string }>(
+    'team.send-message-to-agent'
+  ),
+  stop: bridge.buildProvider<void, { teamId: string }>('team.stop'),
+  ensureSession: bridge.buildProvider<void, { teamId: string }>('team.ensure-session'),
+  renameAgent: bridge.buildProvider<void, { teamId: string; slotId: string; newName: string }>('team.rename-agent'),
+  renameTeam: bridge.buildProvider<void, { id: string; name: string }>('team.rename'),
+  setSessionMode: bridge.buildProvider<void, { teamId: string; sessionMode: string }>('team.set-session-mode'),
+  agentStatusChanged: bridge.buildEmitter<import('@process/team/types').ITeamAgentStatusEvent>('team.agent.status'),
+  agentSpawned: bridge.buildEmitter<import('@/common/types/teamTypes').ITeamAgentSpawnedEvent>('team.agent.spawned'),
+  agentRemoved: bridge.buildEmitter<import('@/common/types/teamTypes').ITeamAgentRemovedEvent>('team.agent.removed'),
+  agentRenamed: bridge.buildEmitter<import('@/common/types/teamTypes').ITeamAgentRenamedEvent>('team.agent.renamed'),
+  listChanged: bridge.buildEmitter<import('@/common/types/teamTypes').ITeamListChangedEvent>('team.list-changed'),
+  mcpStatus: bridge.buildEmitter<import('@/common/types/teamTypes').ITeamMcpStatusEvent>('team.mcp.status'),
 };

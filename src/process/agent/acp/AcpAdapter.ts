@@ -24,6 +24,7 @@ export class AcpAdapter {
   private backend: AcpBackend;
   private activeToolCalls: Map<string, IMessageAcpToolCall> = new Map();
   private currentMessageId: string | null = uuid(); // Track current message for streaming chunks
+  private currentPlanMsgId: string | null = null; // Stable id for plan within a turn
 
   constructor(conversationId: string, backend: AcpBackend) {
     this.conversationId = conversationId;
@@ -36,6 +37,13 @@ export class AcpAdapter {
    */
   resetMessageTracking() {
     this.currentMessageId = uuid();
+  }
+
+  /**
+   * Reset plan tracking for a new turn (called when user sends a new message)
+   */
+  resetPlanTracking() {
+    this.currentPlanMsgId = null;
   }
 
   /**
@@ -68,14 +76,15 @@ export class AcpAdapter {
       }
 
       case 'agent_thought_chunk': {
+        // Reset message tracking so content after thinking gets a new msg_id,
+        // ensuring the thinking message appears above subsequent content in the UI
+        this.resetMessageTracking();
         if (update.content) {
           const message = this.convertThoughtChunk(update);
           if (message) {
             messages.push(message);
           }
         }
-        // Reset message tracking for next agent_message_chunk
-        this.resetMessageTracking();
         break;
       }
 
@@ -124,6 +133,11 @@ export class AcpAdapter {
         this.resetMessageTracking();
         break;
 
+      // User message chunks are echoed back during session/load restore.
+      // They are already displayed from local DB, so ignore them silently.
+      case 'user_message_chunk':
+        break;
+
       default: {
         // Handle unexpected session update types
         const unknownUpdate = update as { sessionUpdate?: string };
@@ -148,16 +162,42 @@ export class AcpAdapter {
       position: 'left' as const,
     };
 
-    if (update.content && update.content.text) {
+    const text = this.extractTextFromAgentMessageChunk(update);
+    if (text !== null) {
       return {
         ...baseMessage,
         type: 'text',
         content: {
-          content: update.content.text,
+          content: text,
         },
       } as IMessageText;
     }
 
+    return null;
+  }
+
+  /**
+   * Extract text from ACP agent_message_chunk payload.
+   * Returns null when the chunk does not contain renderable text.
+   */
+  private extractTextFromAgentMessageChunk(update: AgentMessageChunkUpdate['update']): string | null {
+    const content = update.content;
+    if (!content) {
+      console.warn('[AcpAdapter] Dropped agent_message_chunk: missing content payload');
+      return null;
+    }
+
+    if (content.type === 'text') {
+      if (typeof content.text === 'string') {
+        // Keep empty string chunks for stream consistency and observability.
+        return content.text;
+      }
+      console.warn('[AcpAdapter] Dropped text chunk: content.text is not a string');
+      return null;
+    }
+
+    // Non-text chunks (e.g. image) are currently not rendered in chat stream.
+    console.warn(`[AcpAdapter] Dropped non-text chunk: content.type=${String(content.type)}`);
     return null;
   }
 
@@ -263,9 +303,13 @@ export class AcpAdapter {
    * Convert plan update to AionUI message
    */
   private convertPlanUpdate(update: PlanUpdate): IMessagePlan | null {
+    // Reuse the same msg_id within a turn so plan updates merge into one message
+    if (!this.currentPlanMsgId) {
+      this.currentPlanMsgId = uuid();
+    }
     const baseMessage = {
-      id: uuid(),
-      msg_id: uuid(), // 生成独立的 msg_id，避免与其他消息合并
+      id: this.currentPlanMsgId,
+      msg_id: this.currentPlanMsgId,
       conversation_id: this.conversationId,
       createdAt: Date.now(),
       position: 'left' as const,

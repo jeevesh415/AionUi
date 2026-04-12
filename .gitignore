@@ -193,7 +193,16 @@ lint-results.txt
 
 # Superpowers brainstorm tool (runtime files, session data)
 .superpowers/
+docs/superpowers/
 resources/bundled-bun
+resources/bundled-aionrs
+resources/hub
 
 # Server build output
 dist-server/
+.omc/
+.superset/
+.claude/teams/
+iterations/
+graphify-out/
+.graphify_python

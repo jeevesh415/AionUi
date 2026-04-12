@@ -83,6 +83,9 @@ export class OpenClawAgent {
   // Fallback text buffered from agent.stream="assistant" events,
   // used when chat:delta is dropped (dropIfSlow) and chat:final has no message.
   private agentAssistantFallbackText = '';
+  // Guard flag to prevent late-arriving chat events from creating duplicate messages
+  // after the turn has already ended (e.g. delta after final, or double final).
+  private turnActive = false;
 
   private readonly onStreamEvent: (data: IResponseMessage) => void;
   private readonly onSignalEvent?: (data: IResponseMessage) => void;
@@ -189,8 +192,6 @@ export class OpenClawAgent {
     this.pendingPermissions.clear();
     this.pendingNavigationTools.clear();
 
-    this.emitStatusMessage('disconnected');
-
     // Emit finish event
     this.onStreamEvent({
       type: 'finish',
@@ -211,6 +212,7 @@ export class OpenClawAgent {
       }
 
       // Reset streaming state for new message
+      this.turnActive = true;
       this.currentStreamMsgId = null;
       this.accumulatedAssistantText = '';
       this.agentAssistantFallbackText = '';
@@ -366,6 +368,10 @@ export class OpenClawAgent {
   private handleChatEvent(event: ChatEvent): void {
     // Filter out events from other sessions to prevent cross-session message contamination
     if (this.isFromOtherSession(event.sessionKey)) return;
+    // Ignore late chat events after turn has ended to prevent duplicate messages.
+    // After handleEndTurn() resets state, a late delta/final could create a new msg_id
+    // and re-emit the same content, causing the user to see duplicate replies.
+    if (!this.turnActive) return;
     switch (event.state) {
       case 'delta': {
         // Extract cumulative text from the message (gateway sends cumulative snapshots)
@@ -711,6 +717,7 @@ export class OpenClawAgent {
 
   private handleEndTurn(): void {
     // Reset streaming state for next turn
+    this.turnActive = false;
     this.currentStreamMsgId = null;
     this.accumulatedAssistantText = '';
     this.agentAssistantFallbackText = '';
@@ -732,9 +739,6 @@ export class OpenClawAgent {
   }
 
   private handleDisconnect(reason: string): void {
-    this.emitStatusMessage('disconnected');
-    this.emitErrorMessage(`Gateway disconnected: ${reason}`, 'disconnect');
-
     if (this.onSignalEvent) {
       this.onSignalEvent({
         type: 'finish',
@@ -752,7 +756,7 @@ export class OpenClawAgent {
 
   // ========== Message Emission ==========
 
-  private emitStatusMessage(status: 'connecting' | 'connected' | 'session_active' | 'disconnected' | 'error'): void {
+  private emitStatusMessage(status: 'connecting' | 'connected' | 'session_active' | 'error'): void {
     if (!this.statusMessageId) {
       this.statusMessageId = uuid();
     }

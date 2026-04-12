@@ -14,6 +14,7 @@ import ChannelDiscordLogo from '@/renderer/assets/channel-logos/discord.svg';
 import ChannelLarkLogo from '@/renderer/assets/channel-logos/lark.svg';
 import ChannelSlackLogo from '@/renderer/assets/channel-logos/slack.svg';
 import ChannelTelegramLogo from '@/renderer/assets/channel-logos/telegram.svg';
+import ChannelWeixinLogo from '@/renderer/assets/channel-logos/weixin.svg';
 import { isElectronDesktop } from '@/renderer/utils/platform';
 import { Button, Form, Input, Message, Switch, Tabs, Tooltip } from '@arco-design/web-react';
 import { CheckOne, Communication, Copy, Earth, EditTwo, Refresh } from '@icon-park/react';
@@ -47,6 +48,7 @@ const CHANNEL_LOGOS = [
   { src: ChannelTelegramLogo, alt: 'Telegram' },
   { src: ChannelLarkLogo, alt: 'Lark' },
   { src: ChannelDingTalkLogo, alt: 'DingTalk' },
+  { src: ChannelWeixinLogo, alt: 'WeChat' },
   { src: ChannelSlackLogo, alt: 'Slack' },
   { src: ChannelDiscordLogo, alt: 'Discord' },
 ] as const;
@@ -479,7 +481,19 @@ const WebuiModalContent: React.FC = () => {
         setCanShowPlainPassword(false);
         setStatus((prev) => (prev ? { ...prev, initialPassword: undefined } : null));
       } else {
-        Message.error(result.msg || t('settings.webui.passwordChangeFailed'));
+        // Translate backend error codes to localized messages
+        // Backend may join multiple codes with '; ' (e.g. "PASSWORD_TOO_SHORT; PASSWORD_TOO_COMMON")
+        const errorCodeMap: Record<string, string> = {
+          PASSWORD_TOO_SHORT: t('settings.webui.passwordTooShort'),
+          PASSWORD_TOO_LONG: t('settings.webui.passwordTooLong'),
+          PASSWORD_TOO_COMMON: t('settings.webui.passwordTooCommon'),
+        };
+        const rawMsg = result.msg || '';
+        const codes = rawMsg.split('; ');
+        const translated = codes.map((code) => errorCodeMap[code]).filter(Boolean);
+        Message.error(
+          translated.length > 0 ? translated.join('; ') : rawMsg || t('settings.webui.passwordChangeFailed')
+        );
       }
     } catch (error) {
       console.error('Set new password error:', error);

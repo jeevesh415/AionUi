@@ -1,9 +1,20 @@
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
+import { execSync } from 'child_process';
 import { resolve } from 'path';
 import { sentryVitePlugin } from '@sentry/vite-plugin';
 import UnoCSS from 'unocss/vite';
 import unoConfig from './uno.config.ts';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
+
+// Build builtin MCP servers after main process bundle so they survive out/main/ cleanup.
+function buildMcpServersPlugin() {
+  return {
+    name: 'vite-plugin-build-mcp-servers',
+    closeBundle() {
+      execSync(`node "${resolve('scripts/build-mcp-servers.js')}"`, { stdio: 'inherit' });
+    },
+  };
+}
 
 // Icon Park transform plugin (replaces webpack icon-park-loader)
 function iconParkPlugin() {
@@ -67,6 +78,18 @@ export default defineConfig(({ mode }) => {
         // externalizeDepsPlugin replaces our custom getExternalDeps() + pluginExternalizeDynamicImports.
         // 'fix-path' excluded so it gets bundled inline (only 3KB).
         externalizeDepsPlugin({ exclude: ['fix-path'] }),
+        ...(isDevelopment
+          ? [
+              {
+                name: 'dev-build-mcp-servers',
+                closeBundle() {
+                  execSync(`node "${resolve(__dirname, 'scripts/build-mcp-servers.js')}"`, {
+                    stdio: 'inherit',
+                  });
+                },
+              },
+            ]
+          : []),
         ...(!isDevelopment
           ? [
               viteStaticCopy({
@@ -85,6 +108,7 @@ export default defineConfig(({ mode }) => {
             ]
           : []),
         ...(enableSentrySourceMaps ? [sentryVitePlugin(sentryPluginOptions)] : []),
+        ...(isDevelopment ? [buildMcpServersPlugin()] : []),
       ],
       resolve: { alias: mainAliases, extensions: ['.ts', '.tsx', '.js', '.json'] },
       build: {
@@ -98,11 +122,12 @@ export default defineConfig(({ mode }) => {
             // splitting places it in a chunks/ subdirectory.
             gemini: resolve('src/process/worker/gemini.ts'),
             acp: resolve('src/process/worker/acp.ts'),
-            codex: resolve('src/process/worker/codex.ts'),
             'openclaw-gateway': resolve('src/process/worker/openclaw-gateway.ts'),
             nanobot: resolve('src/process/worker/nanobot.ts'),
-            // Built-in MCP server entry points
-            'builtin-mcp-image-gen': resolve('src/process/resources/builtinMcp/imageGenServer.ts'),
+            lifecycleRunner: resolve('src/process/extensions/lifecycle/lifecycleRunner.ts'),
+            aionrs: resolve('src/process/worker/aionrs.ts'),
+            // Built-in MCP server entry points (compiled by scripts/build-mcp-servers.js via esbuild,
+            // not vite — esbuild bundles all deps for self-contained execution by external node processes)
           },
           onwarn(warning, warn) {
             if (warning.code === 'EVAL') return;
@@ -111,6 +136,7 @@ export default defineConfig(({ mode }) => {
         },
       },
       define: {
+        'process.env.NODE_ENV': JSON.stringify(mode),
         'process.env.env': JSON.stringify(process.env.env),
         'process.env.SENTRY_DSN': JSON.stringify(process.env.SENTRY_DSN ?? ''),
       },
@@ -125,23 +151,31 @@ export default defineConfig(({ mode }) => {
       build: {
         sourcemap: false,
         reportCompressedSize: false,
-        rollupOptions: { input: { index: resolve('src/preload.ts') } },
+        rollupOptions: {
+          input: {
+            index: resolve('src/preload/main.ts'),
+            petPreload: resolve('src/preload/petPreload.ts'),
+            petHitPreload: resolve('src/preload/petHitPreload.ts'),
+            petConfirmPreload: resolve('src/preload/petConfirmPreload.ts'),
+          },
+        },
       },
     },
 
     renderer: {
       base: './',
+      publicDir: resolve('public'),
+      appType: 'mpa',
       server: {
-        // Keep renderer HTTP port deterministic for Electron runtime URL injection.
-        // If 5173 is unavailable, fail fast instead of auto-switching to 5174+,
-        // which causes renderer resource requests to target the wrong origin.
+        // Default to 5173; when occupied (e.g. another AionUi clone is running),
+        // Vite auto-increments to the next available port.
+        // electron-vite reads the actual port and sets ELECTRON_RENDERER_URL accordingly.
         port: 5173,
-        strictPort: true,
-        // Explicit HMR config so Vite client connects directly to the Vite dev server,
-        // not to the WebUI proxy server (which would reject the WebSocket and cause infinite reload)
+        // Explicit HMR host so Vite client connects directly to the Vite dev server,
+        // not to the WebUI proxy server (which would reject the WebSocket and cause infinite reload).
+        // Port is omitted so it automatically matches the server port.
         hmr: {
           host: 'localhost',
-          port: 5173,
         },
       },
       resolve: {
@@ -170,8 +204,17 @@ export default defineConfig(({ mode }) => {
         chunkSizeWarningLimit: 1500,
         cssCodeSplit: true,
         rollupOptions: {
-          input: { index: resolve('src/renderer/index.html') },
+          input: {
+            index: resolve('src/renderer/index.html'),
+            pet: resolve('src/renderer/pet/pet.html'),
+            'pet-hit': resolve('src/renderer/pet/pet-hit.html'),
+            'pet-confirm': resolve('src/renderer/pet/pet-confirm.html'),
+          },
           external: ['node:crypto', 'crypto'],
+          onwarn(warning, warn) {
+            if (warning.code === 'EVAL') return;
+            warn(warning);
+          },
           output: {
             manualChunks(id: string) {
               if (!id.includes('node_modules')) return undefined;
@@ -209,7 +252,9 @@ export default defineConfig(({ mode }) => {
         },
       },
       define: {
+        'process.env.NODE_ENV': JSON.stringify(mode),
         'process.env.env': JSON.stringify(process.env.env),
+        'process.env.AIONUI_MULTI_INSTANCE': JSON.stringify(process.env.AIONUI_MULTI_INSTANCE ?? ''),
         'process.env.SENTRY_DSN': JSON.stringify(process.env.SENTRY_DSN ?? ''),
         global: 'globalThis',
       },

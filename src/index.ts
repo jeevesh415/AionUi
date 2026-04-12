@@ -25,13 +25,16 @@ import { AION_ASSET_PROTOCOL } from '@process/extensions';
 import { initializeProcess } from './process';
 import { ProcessConfig } from './process/utils/initStorage';
 import { loadShellEnvironmentAsync, logEnvironmentDiagnostics, mergePaths } from './process/utils/shellEnv';
-import { initializeAcpDetector, registerWindowMaximizeListeners } from '@process/bridge';
+import { initializeAcpDetector, registerWindowMaximizeListeners, disposeAllTeamSessions } from '@process/bridge';
+import './process/bridge/feedbackBridge';
+import { wasLaunchedAtLogin } from '@process/bridge/applicationBridge';
 import { onCloseToTrayChanged, onLanguageChanged } from './process/bridge/systemSettingsBridge';
 import { setInitialLanguage } from '@process/services/i18n';
 import { workerTaskManager } from './process/task/workerTaskManagerSingleton';
 import { setupApplicationMenu } from './process/utils/appMenu';
 import { startWebServer } from './process/webserver';
-import { applyZoomToWindow } from './process/utils/zoom';
+import { initializeZoomFactor, setupZoomForWindow } from './process/utils/zoom';
+import { getOrCreateAnalyticsId } from './process/utils/analyticsId';
 import {
   clearPendingDeepLinkUrl,
   getPendingDeepLinkUrl,
@@ -66,8 +69,9 @@ import electronSquirrelStartup from 'electron-squirrel-startup';
 // When a second instance starts (e.g. from protocol URL), it sends its data
 // to the first instance via second-instance event, then quits.
 const isE2ETestMode = process.env.AIONUI_E2E_TEST === '1';
+const skipSingleInstanceLock = isE2ETestMode || process.env.AIONUI_MULTI_INSTANCE === '1';
 const deepLinkFromArgv = process.argv.find((arg) => arg.startsWith(`${PROTOCOL_SCHEME}://`));
-const gotTheLock = isE2ETestMode ? true : app.requestSingleInstanceLock({ deepLinkUrl: deepLinkFromArgv });
+const gotTheLock = skipSingleInstanceLock ? true : app.requestSingleInstanceLock({ deepLinkUrl: deepLinkFromArgv });
 if (!gotTheLock) {
   console.warn('[AionUi] Another instance is already running; current process will exit.');
   app.quit();
@@ -84,6 +88,9 @@ if (!gotTheLock) {
     if (isWebUIMode || isResetPasswordMode) {
       return;
     }
+
+    // Skip window creation if app hasn't finished initializing
+    if (!appReadyDone) return;
 
     if (app.isReady()) {
       showOrCreateMainWindow({
@@ -123,8 +130,9 @@ if (process.platform === 'darwin' || process.platform === 'linux') {
 }
 
 // Log environment diagnostics once at startup (persisted via electron-log).
-// Helps debug PATH / cygpath issues on Windows (#1157).
-logEnvironmentDiagnostics();
+// Phase 1 prints sync info immediately; Phase 2 resolves CLI tools in the
+// background — fire-and-forget so it never blocks the startup path (#1157).
+void logEnvironmentDiagnostics();
 
 // Handle Squirrel startup events (Windows installer)
 if (electronSquirrelStartup) {
@@ -186,9 +194,15 @@ const isVersionMode = hasCommand('--version') || hasCommand('-v');
 // Flag to distinguish intentional quit from unexpected exit in WebUI mode
 let isExplicitQuit = false;
 
+// Guard against premature window creation (e.g. macOS 'activate' firing during init).
+// The activate event fires on first launch before handleAppReady finishes initializeProcess(),
+// causing the renderer to load and compete with initStorage on the serial configFile queue,
+// which blocks startup for 100-265 seconds.
+let appReadyDone = false;
+
 let mainWindow: BrowserWindow;
 
-const createWindow = (): void => {
+const createWindow = ({ showOnReady = true }: { showOnReady?: boolean } = {}): void => {
   console.log('[AionUi] Creating main window...');
   // Get primary display size
   const primaryDisplay = screen.getPrimaryDisplay();
@@ -228,7 +242,12 @@ const createWindow = (): void => {
     ...(process.platform === 'darwin'
       ? {
           titleBarStyle: 'hidden',
-          trafficLightPosition: { x: 10, y: 10 },
+          // Align traffic-light vertical center with the titlebar button centers.
+          // Titlebar is 45px; buttons are 36px flex-centered → button center y≈22.5.
+          // Empirically y=13 places the traffic lights on the same horizontal line
+          // as the sidebar / back / forward icons.
+          // NOTE: requires a full app restart to take effect (BrowserWindow option).
+          trafficLightPosition: { x: 10, y: 13 },
         }
       : { frame: false }),
     webPreferences: {
@@ -241,30 +260,34 @@ const createWindow = (): void => {
   // Show window after content is ready to prevent FOUC (Flash of Unstyled Content)
   // Use 'ready-to-show' which fires when renderer has painted first frame,
   // combined with 'did-finish-load' as belt-and-suspenders approach.
-  const showWindow = () => {
-    if (!mainWindow.isDestroyed() && !mainWindow.isVisible()) {
-      console.log('[AionUi] Showing main window');
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  };
-  mainWindow.once('ready-to-show', () => {
-    console.log('[AionUi] Window ready-to-show');
-    showWindow();
-  });
-  // Belt-and-suspenders: also show on did-finish-load in case ready-to-show already fired
-  mainWindow.webContents.once('did-finish-load', () => {
-    console.log('[AionUi] Renderer did-finish-load');
-    showWindow();
-  });
-  // Fallback: show window after 5s even if events don't fire (e.g. loadURL failure)
-  setTimeout(showWindow, 5000);
+  if (showOnReady) {
+    const showWindow = () => {
+      if (!mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+        console.log('[AionUi] Showing main window');
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    };
+    mainWindow.once('ready-to-show', () => {
+      console.log('[AionUi] Window ready-to-show');
+      showWindow();
+    });
+    // Belt-and-suspenders: also show on did-finish-load in case ready-to-show already fired
+    mainWindow.webContents.once('did-finish-load', () => {
+      console.log('[AionUi] Renderer did-finish-load');
+      showWindow();
+    });
+    // Fallback: show window after 5s even if events don't fire (e.g. loadURL failure)
+    setTimeout(showWindow, 5000);
+  } else if (process.platform === 'darwin' && app.dock) {
+    void app.dock.hide();
+  }
 
   initMainAdapterWithWindow(mainWindow);
   bindMainWindowReferences(mainWindow);
   setupApplicationMenu();
 
-  void applyZoomToWindow(mainWindow);
+  setupZoomForWindow(mainWindow);
   registerWindowMaximizeListeners(mainWindow);
 
   // Initialize auto-updater service (skip when disabled via env, e.g. E2E / CI)
@@ -316,6 +339,23 @@ const createWindow = (): void => {
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     console.error('[AionUi] render-process-gone:', details);
+
+    // Reload the renderer to recover from the crash.
+    // The isDestroyed() guard in adapter/main.ts prevents further sends
+    // to the dead webContents while the reload is in progress.
+    if (!mainWindow.isDestroyed()) {
+      console.log('[AionUi] Attempting to recover from renderer crash by reloading...');
+
+      if (!app.isPackaged && rendererUrl) {
+        mainWindow.loadURL(rendererUrl).catch((error) => {
+          console.error('[AionUi] Recovery loadURL failed:', error.message || error);
+        });
+      } else {
+        mainWindow.loadFile(fallbackFile).catch((error) => {
+          console.error('[AionUi] Recovery loadFile failed:', error.message || error);
+        });
+      }
+    }
   });
 
   mainWindow.webContents.on('unresponsive', () => {
@@ -341,6 +381,7 @@ const createWindow = (): void => {
   // 关闭拦截：当启用"关闭到托盘"时，隐藏窗口而非关闭
   // Close interception: hide window instead of closing when "close to tray" is enabled
   mainWindow.on('close', (event) => {
+    if (mainWindow.isDestroyed()) return;
     if (getCloseToTrayEnabled() && !getIsQuitting()) {
       event.preventDefault();
       mainWindow.hide();
@@ -392,6 +433,8 @@ const handleAppReady = async (): Promise<void> => {
     }
   }
 
+  Sentry.setUser({ id: getOrCreateAnalyticsId() });
+
   try {
     await initializeProcess();
     mark('initializeProcess');
@@ -401,21 +444,24 @@ const handleAppReady = async (): Promise<void> => {
     return;
   }
 
+  try {
+    initializeZoomFactor(await ProcessConfig.get('ui.zoomFactor'));
+    mark('initializeZoomFactor');
+  } catch (error) {
+    console.error('[AionUi] Failed to restore zoom factor:', error);
+    initializeZoomFactor(undefined);
+  }
+
   if (isResetPasswordMode) {
     // Handle password reset without creating window
     try {
-      // Get username argument, filtering out flags (--xxx)
-      // 获取用户名参数，过滤掉标志（--xxx）
-      const resetPasswordIndex = process.argv.indexOf('--resetpass');
-      const argsAfterCommand = process.argv.slice(resetPasswordIndex + 1);
-      const username = argsAfterCommand.find((arg) => !arg.startsWith('--')) || 'admin';
+      const { resetPasswordCLI, resolveResetPasswordUsername } = await import('./process/utils/resetPasswordCLI');
+      const username = resolveResetPasswordUsername(process.argv);
 
-      // Import resetpass logic
-      const { resetPasswordCLI } = await import('./process/utils/resetPasswordCLI');
       await resetPasswordCLI(username);
 
       app.quit();
-    } catch (error) {
+    } catch {
       app.exit(1);
     }
   } else if (isWebUIMode) {
@@ -425,7 +471,13 @@ const handleAppReady = async (): Promise<void> => {
     }
     const resolvedPort = resolveWebUIPort(userConfigInfo.config, getSwitchValue);
     const allowRemote = resolveRemoteAccess(userConfigInfo.config, isRemoteMode);
-    await startWebServer(resolvedPort, allowRemote);
+    try {
+      await startWebServer(resolvedPort, allowRemote);
+    } catch (err) {
+      console.error(`[WebUI] Failed to start server on port ${resolvedPort}:`, err);
+      app.exit(1);
+      return;
+    }
 
     // Keep the process alive in WebUI mode by preventing default quit behavior.
     // On Linux headless (systemd), Electron may attempt to quit when no windows exist.
@@ -438,27 +490,6 @@ const handleAppReady = async (): Promise<void> => {
       }
     });
   } else {
-    createWindow();
-    mark('createWindow');
-
-    // Run ACP detection in parallel with renderer loading.
-    // By the time React mounts and calls getAvailableAgents (~300ms+),
-    // detection (~700ms) is usually already done.
-    initializeAcpDetector()
-      .then(() => mark('initializeAcpDetector'))
-      .catch((error) => console.error('[ACP] Detection failed:', error));
-
-    // 读取语言设置并初始化主进程 i18n，然后刷新托盘菜单
-    // Read language setting and initialize main process i18n, then refresh tray menu
-    try {
-      const savedLanguage = await ProcessConfig.get('language');
-      await setInitialLanguage(savedLanguage);
-      // After language is set, refresh tray menu if it exists
-      await refreshTrayMenu();
-    } catch (error) {
-      console.error('[index] Failed to initialize i18n language:', error);
-    }
-
     // 初始化关闭到托盘设置 / Initialize close-to-tray setting
     if (isE2ETestMode) {
       setCloseToTrayEnabled(false);
@@ -482,6 +513,49 @@ const handleAppReady = async (): Promise<void> => {
           destroyTray();
         }
       });
+    }
+
+    const showMainWindowOnReady = !(wasLaunchedAtLogin() && getCloseToTrayEnabled());
+
+    createWindow({ showOnReady: showMainWindowOnReady });
+    appReadyDone = true;
+    mark('createWindow');
+
+    // Initialize desktop pet (delayed to not block main window)
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const petEnabled = await ProcessConfig.get('pet.enabled');
+          if (petEnabled === true) {
+            // Read pet sub-settings before creating the pet so flags are honored
+            // on the first createPetWindow() call (which is sync).
+            const confirmEnabled = (await ProcessConfig.get('pet.confirmEnabled')) ?? true;
+            const { createPetWindow, setPetConfirmEnabled } = await import('./process/pet/petManager');
+            setPetConfirmEnabled(confirmEnabled);
+            createPetWindow();
+          }
+        } catch (error) {
+          console.error('[Pet] Failed to initialize:', error);
+        }
+      })();
+    }, 3000);
+
+    // Run ACP detection in parallel with renderer loading.
+    // By the time React mounts and calls getAvailableAgents (~300ms+),
+    // detection (~700ms) is usually already done.
+    initializeAcpDetector()
+      .then(() => mark('initializeAcpDetector'))
+      .catch((error) => console.error('[ACP] Detection failed:', error));
+
+    // 读取语言设置并初始化主进程 i18n，然后刷新托盘菜单
+    // Read language setting and initialize main process i18n, then refresh tray menu
+    try {
+      const savedLanguage = await ProcessConfig.get('language');
+      await setInitialLanguage(savedLanguage);
+      // After language is set, refresh tray menu if it exists
+      await refreshTrayMenu();
+    } catch (error) {
+      console.error('[index] Failed to initialize i18n language:', error);
     }
 
     // 监听语言变更，刷新托盘菜单文案 / Listen for language changes to refresh tray menu labels
@@ -583,8 +657,9 @@ app.on('open-url', (event, url) => {
 void app
   .whenReady()
   .then(handleAppReady)
-  .catch((_error) => {
+  .catch((error) => {
     // App initialization failed
+    console.error('[AionUi] App initialization failed:', error);
     app.quit();
   });
 
@@ -605,6 +680,8 @@ app.on('window-all-closed', () => {
 app.on('activate', () => {
   // On OS X it's common to re-create a window in the app when the
   // dock icon is clicked and there are no other windows open.
+  // Skip if handleAppReady hasn't finished — it will create the window itself.
+  if (!appReadyDone) return;
   if (!isWebUIMode && app.isReady()) {
     if (mainWindow && !mainWindow.isDestroyed()) {
       // 从托盘恢复隐藏的窗口 / Restore hidden window from tray
@@ -625,6 +702,17 @@ app.on('before-quit', async () => {
   destroyTray();
   // 在应用退出前清理工作进程
   workerTaskManager.clear();
+
+  // Destroy desktop pet windows
+  try {
+    const { destroyPetWindow } = await import('./process/pet/petManager');
+    destroyPetWindow();
+  } catch {
+    /* pet not initialized */
+  }
+
+  // Stop all active team sessions (TCP servers + child processes)
+  await disposeAllTeamSessions().catch((err) => console.error('[App] Failed to dispose team sessions:', err));
 
   // Shutdown Channel subsystem
   try {

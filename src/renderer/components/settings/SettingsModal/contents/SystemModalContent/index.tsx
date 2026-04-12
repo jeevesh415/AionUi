@@ -5,13 +5,18 @@
  */
 
 import { ipcBridge } from '@/common';
+import type { IStartOnBootStatus } from '@/common/adapter/ipcBridge';
+import { ConfigStorage } from '@/common/config/storage';
 import LanguageSwitcher from '@/renderer/components/settings/LanguageSwitcher';
+import { AUTO_PREVIEW_OFFICE_FILES_SWR_KEY } from '@/renderer/hooks/system/useAutoPreviewOfficeFilesEnabled';
+import { COMMAND_QUEUE_ENABLED_SWR_KEY } from '@/renderer/hooks/system/useCommandQueueEnabled';
 import { iconColors } from '@/renderer/styles/colors';
-import { Alert, Button, Collapse, Form, Modal, Switch, Tooltip } from '@arco-design/web-react';
+import { isElectronDesktop } from '@/renderer/utils/platform';
+import { Alert, Button, Collapse, Form, InputNumber, Message, Modal, Switch, Tooltip } from '@arco-design/web-react';
 import { FolderSearch } from '@icon-park/react';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import useSWR from 'swr';
+import useSWR, { mutate as mutateSWR } from 'swr';
 import AionScrollArea from '@/renderer/components/base/AionScrollArea';
 import { useSettingsViewMode } from '../../settingsViewContext';
 import DevSettings from './DevSettings';
@@ -26,6 +31,7 @@ import PreferenceRow from './PreferenceRow';
  */
 const SystemModalContent: React.FC = () => {
   const { t } = useTranslation();
+  const isDesktop = isElectronDesktop();
   const [form] = Form.useForm();
   const [modal, modalContextHolder] = Modal.useModal();
   const [error, setError] = useState<string | null>(null);
@@ -33,9 +39,35 @@ const SystemModalContent: React.FC = () => {
   const isPageMode = viewMode === 'page';
   const initializingRef = useRef(true);
 
+  const [startOnBoot, setStartOnBoot] = useState<IStartOnBootStatus>({
+    supported: false,
+    enabled: false,
+    isPackaged: false,
+    platform: 'web',
+  });
   const [closeToTray, setCloseToTray] = useState(false);
   const [notificationEnabled, setNotificationEnabled] = useState(true);
   const [cronNotificationEnabled, setCronNotificationEnabled] = useState(false);
+  const [promptTimeout, setPromptTimeout] = useState<number>(300);
+  const [agentIdleTimeout, setAgentIdleTimeout] = useState<number>(5);
+  const [saveUploadToWorkspace, setSaveUploadToWorkspace] = useState(false);
+  const [commandQueueEnabled, setCommandQueueEnabled] = useState(true);
+  const [autoPreviewOfficeFiles, setAutoPreviewOfficeFiles] = useState(true);
+
+  useEffect(() => {
+    if (!isDesktop) {
+      return;
+    }
+
+    ipcBridge.application.getStartOnBootStatus
+      .invoke()
+      .then((result) => {
+        if (result.success && result.data) {
+          setStartOnBoot(result.data);
+        }
+      })
+      .catch(() => {});
+  }, [isDesktop]);
 
   useEffect(() => {
     ipcBridge.systemSettings.getCloseToTray
@@ -58,12 +90,73 @@ const SystemModalContent: React.FC = () => {
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    ConfigStorage.get('acp.promptTimeout')
+      .then((val) => {
+        if (val && val > 0) setPromptTimeout(val);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    ConfigStorage.get('acp.agentIdleTimeout')
+      .then((val) => {
+        if (val && val > 0) setAgentIdleTimeout(val);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    ipcBridge.systemSettings.getSaveUploadToWorkspace
+      .invoke()
+      .then((enabled) => setSaveUploadToWorkspace(enabled))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    ipcBridge.systemSettings.getCommandQueueEnabled
+      .invoke()
+      .then((enabled) => setCommandQueueEnabled(enabled))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    ipcBridge.systemSettings.getAutoPreviewOfficeFiles
+      .invoke()
+      .then((enabled) => setAutoPreviewOfficeFiles(enabled))
+      .catch(() => {});
+  }, []);
+
   const handleCloseToTrayChange = useCallback((checked: boolean) => {
     setCloseToTray(checked);
     ipcBridge.systemSettings.setCloseToTray.invoke({ enabled: checked }).catch(() => {
       setCloseToTray(!checked);
     });
   }, []);
+
+  const handleStartOnBootChange = useCallback(
+    (checked: boolean) => {
+      const previousStatus = startOnBoot;
+      setStartOnBoot((prev) => ({ ...prev, enabled: checked }));
+
+      ipcBridge.application.setStartOnBoot
+        .invoke({ enabled: checked })
+        .then((result) => {
+          if (result.success && result.data) {
+            setStartOnBoot(result.data);
+            return;
+          }
+
+          setStartOnBoot(previousStatus);
+          Message.error(result.msg || t('settings.startOnBootUpdateFailed'));
+        })
+        .catch(() => {
+          setStartOnBoot(previousStatus);
+          Message.error(t('settings.startOnBootUpdateFailed'));
+        });
+    },
+    [startOnBoot, t]
+  );
 
   const handleNotificationEnabledChange = useCallback((checked: boolean) => {
     setNotificationEnabled(checked);
@@ -76,6 +169,59 @@ const SystemModalContent: React.FC = () => {
     setCronNotificationEnabled(checked);
     ipcBridge.systemSettings.setCronNotificationEnabled.invoke({ enabled: checked }).catch(() => {
       setCronNotificationEnabled(!checked);
+    });
+  }, []);
+
+  const handlePromptTimeoutChange = useCallback((val: number | undefined) => {
+    setPromptTimeout(val as number);
+  }, []);
+
+  const handlePromptTimeoutBlur = useCallback(() => {
+    const clamped = Math.max(30, Math.min(3600, promptTimeout || 300));
+    setPromptTimeout(clamped);
+    ConfigStorage.set('acp.promptTimeout', clamped).catch(() => {});
+  }, [promptTimeout]);
+
+  const handleAgentIdleTimeoutChange = useCallback((val: number | undefined) => {
+    setAgentIdleTimeout(val as number);
+  }, []);
+
+  const handleAgentIdleTimeoutBlur = useCallback(() => {
+    const clamped = Math.max(1, Math.min(60, agentIdleTimeout || 5));
+    setAgentIdleTimeout(clamped);
+    ConfigStorage.set('acp.agentIdleTimeout', clamped).catch(() => {});
+  }, [agentIdleTimeout]);
+
+  const handleSaveUploadToWorkspaceChange = useCallback((checked: boolean) => {
+    setSaveUploadToWorkspace(checked);
+    ipcBridge.systemSettings.setSaveUploadToWorkspace.invoke({ enabled: checked }).catch(() => {
+      setSaveUploadToWorkspace(!checked);
+    });
+  }, []);
+
+  const handleCommandQueueEnabledChange = useCallback((checked: boolean) => {
+    setCommandQueueEnabled(checked);
+    void mutateSWR(COMMAND_QUEUE_ENABLED_SWR_KEY, checked, {
+      revalidate: false,
+    });
+    ipcBridge.systemSettings.setCommandQueueEnabled.invoke({ enabled: checked }).catch(() => {
+      setCommandQueueEnabled(!checked);
+      void mutateSWR(COMMAND_QUEUE_ENABLED_SWR_KEY, !checked, {
+        revalidate: false,
+      });
+    });
+  }, []);
+
+  const handleAutoPreviewOfficeFilesChange = useCallback((checked: boolean) => {
+    setAutoPreviewOfficeFiles(checked);
+    void mutateSWR(AUTO_PREVIEW_OFFICE_FILES_SWR_KEY, checked, {
+      revalidate: false,
+    });
+    ipcBridge.systemSettings.setAutoPreviewOfficeFiles.invoke({ enabled: checked }).catch(() => {
+      setAutoPreviewOfficeFiles(!checked);
+      void mutateSWR(AUTO_PREVIEW_OFFICE_FILES_SWR_KEY, !checked, {
+        revalidate: false,
+      });
     });
   }, []);
 
@@ -96,9 +242,65 @@ const SystemModalContent: React.FC = () => {
   const preferenceItems = [
     { key: 'language', label: t('settings.language'), component: <LanguageSwitcher /> },
     {
+      key: 'startOnBoot',
+      label: t('settings.startOnBoot'),
+      description: startOnBoot.supported ? t('settings.startOnBootDesc') : t('settings.startOnBootUnsupported'),
+      component: (
+        <Switch checked={startOnBoot.enabled} onChange={handleStartOnBootChange} disabled={!startOnBoot.supported} />
+      ),
+    },
+    {
       key: 'closeToTray',
       label: t('settings.closeToTray'),
       component: <Switch checked={closeToTray} onChange={handleCloseToTrayChange} />,
+    },
+    {
+      key: 'promptTimeout',
+      label: t('settings.promptTimeout'),
+      component: (
+        <InputNumber
+          value={promptTimeout}
+          onChange={handlePromptTimeoutChange}
+          onBlur={handlePromptTimeoutBlur}
+          max={3600}
+          step={30}
+          style={{ width: 120 }}
+          suffix='s'
+        />
+      ),
+    },
+    {
+      key: 'agentIdleTimeout',
+      label: t('settings.agentIdleTimeout'),
+      description: t('settings.agentIdleTimeoutDesc'),
+      component: (
+        <InputNumber
+          value={agentIdleTimeout}
+          onChange={handleAgentIdleTimeoutChange}
+          onBlur={handleAgentIdleTimeoutBlur}
+          max={60}
+          step={5}
+          style={{ width: 120 }}
+          suffix='min'
+        />
+      ),
+    },
+    {
+      key: 'saveUploadToWorkspace',
+      label: t('settings.saveUploadToWorkspace'),
+      component: <Switch checked={saveUploadToWorkspace} onChange={handleSaveUploadToWorkspaceChange} />,
+    },
+    {
+      key: 'commandQueueEnabled',
+      label: t('settings.commandQueueEnabled'),
+      description: t('settings.commandQueueEnabledDesc'),
+      component: <Switch checked={commandQueueEnabled} onChange={handleCommandQueueEnabledChange} />,
+    },
+    {
+      key: 'autoPreviewOfficeFiles',
+      label: t('settings.autoPreviewOfficeFiles'),
+      description: t('settings.autoPreviewOfficeFilesDesc'),
+      component: <Switch checked={autoPreviewOfficeFiles} onChange={handleAutoPreviewOfficeFilesChange} />,
     },
   ];
 
@@ -156,7 +358,7 @@ const SystemModalContent: React.FC = () => {
           <div className='px-[12px] md:px-[32px] py-16px bg-2 rd-16px space-y-12px'>
             <div className='w-full flex flex-col divide-y divide-border-2'>
               {preferenceItems.map((item) => (
-                <PreferenceRow key={item.key} label={item.label}>
+                <PreferenceRow key={item.key} label={item.label} description={item.description}>
                   {item.component}
                 </PreferenceRow>
               ))}

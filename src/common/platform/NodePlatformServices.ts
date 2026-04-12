@@ -64,9 +64,14 @@ export class NodePlatformServices implements IPlatformServices {
   power = {
     preventSleep: (): number | null => null,
     allowSleep: (_id: number | null): void => {},
+    preventDisplaySleep: (): number | null => null,
   };
 
   notification = {
     send: (_opts: { title: string; body: string; icon?: string }): void => {},
+  };
+
+  network = {
+    fetch: (input: string | URL | Request, init?: RequestInit): Promise<Response> => fetch(input, init),
   };
 }

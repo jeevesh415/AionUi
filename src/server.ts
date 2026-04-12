@@ -13,6 +13,7 @@ import './common/platform/register-node';
 import './common/adapter/standalone';
 
 import { initBridgeStandalone } from './process/utils/initBridgeStandalone';
+import { logEnvironmentDiagnostics } from './process/utils/shellEnv';
 import { startWebServerWithInstance } from './process/webserver';
 import { cleanupWebAdapter } from './process/webserver/adapter';
 import initStorage from './process/utils/initStorage';
@@ -22,6 +23,10 @@ import { closeDatabase } from './process/services/database/export';
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
 const ALLOW_REMOTE = process.env.ALLOW_REMOTE === 'true';
+const isResetPasswordMode = process.argv.includes('--resetpass');
+
+// Log environment diagnostics — fire-and-forget so it never blocks startup.
+void logEnvironmentDiagnostics();
 
 // Track server instance for shutdown (set by main() once server is ready)
 let serverInstance: Awaited<ReturnType<typeof startWebServerWithInstance>> | null = null;
@@ -76,6 +81,14 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 async function main(): Promise<void> {
+  if (isResetPasswordMode) {
+    const { resetPasswordCLI, resolveResetPasswordUsername } = await import('./process/utils/resetPasswordCLI');
+    const username = resolveResetPasswordUsername(process.argv);
+    await resetPasswordCLI(username);
+    process.exit(0);
+    return;
+  }
+
   // Initialize storage (respects DATA_DIR env var)
   await initStorage();
 

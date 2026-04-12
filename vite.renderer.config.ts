@@ -43,6 +43,7 @@ function iconParkPlugin() {
 export default defineConfig({
   base: './',
   root: resolve('src/renderer'),
+  publicDir: resolve('public'),
   resolve: {
     alias: {
       '@': resolve('src'),
@@ -101,6 +102,7 @@ export default defineConfig({
     },
   },
   define: {
+    'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
     'process.env.env': JSON.stringify(process.env.env),
     'process.env.SENTRY_DSN': JSON.stringify(process.env.SENTRY_DSN ?? ''),
     global: 'globalThis',

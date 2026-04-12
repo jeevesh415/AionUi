@@ -109,7 +109,11 @@ extraResources:
     to: app.png
   - from: resources/bundled-bun
     to: bundled-bun
-
+  # aionrs binary (pre-compiled per platform/arch)
+  - from: resources/bundled-aionrs
+    to: bundled-aionrs
+  - from: resources/hub
+    to: hub
 win:
   target:
     - nsis
@@ -208,6 +212,8 @@ asarUnpack:
   # at startup, so all runtime reads go through the user directory, not asar.
   # Builtin MCP server scripts must be unpacked so external node processes can execute them
   - 'out/main/builtin-mcp-image-gen.js'
+  - 'out/main/team-mcp-stdio.js'
+  - 'out/main/aion-mcp-stdio.js'
 
 # Compression level: normal for faster builds, maximum for smallest size
 # Note: electron-builder doesn't support YAML template syntax for env vars

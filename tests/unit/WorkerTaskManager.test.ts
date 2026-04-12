@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('electron', () => ({ app: { isPackaged: false, getPath: vi.fn(() => '/tmp') } }));
 
@@ -51,6 +51,10 @@ describe('WorkerTaskManager', () => {
     repo = makeRepo();
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   // --- getTask / addTask ---
 
   it('getTask returns undefined for unknown id', () => {
@@ -85,6 +89,26 @@ describe('WorkerTaskManager', () => {
     expect(agent.kill).toHaveBeenCalled();
   });
 
+  it('forwards idle_timeout when reaping idle cli agents', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-02T10:00:00Z'));
+
+    const agent = {
+      ...makeAgent('c1', 'acp'),
+      status: 'finished',
+      lastActivityAt: Date.now() - 6 * 60 * 1000,
+    };
+    const mgr = new WorkerTaskManager(makeFactory(agent) as any, repo);
+    mgr.addTask('c1', agent as any);
+
+    vi.advanceTimersByTime(1 * 60 * 1000 + 1);
+    // killIdleCliAgents reads config asynchronously — flush the microtask queue
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(agent.kill).toHaveBeenCalledWith('idle_timeout');
+    expect(mgr.getTask('c1')).toBeUndefined();
+  });
+
   it('kill is a no-op for unknown id', () => {
     const mgr = new WorkerTaskManager(makeFactory() as any, repo);
     expect(() => mgr.kill('nonexistent')).not.toThrow();
@@ -92,13 +116,16 @@ describe('WorkerTaskManager', () => {
 
   // --- clear ---
 
-  it('clear kills all tasks and empties the list', () => {
+  it('clear kills all tasks and empties the list', async () => {
+    vi.useFakeTimers();
     const agent1 = makeAgent('c1', 'gemini');
     const agent2 = makeAgent('c2', 'acp');
     const mgr = new WorkerTaskManager(makeFactory() as any, repo);
     mgr.addTask('c1', agent1 as any);
     mgr.addTask('c2', agent2 as any);
-    mgr.clear();
+    const clearPromise = mgr.clear();
+    vi.advanceTimersByTime(3000);
+    await clearPromise;
     expect(agent1.kill).toHaveBeenCalled();
     expect(agent2.kill).toHaveBeenCalled();
     expect(mgr.listTasks()).toHaveLength(0);

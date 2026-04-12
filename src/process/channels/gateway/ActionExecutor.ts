@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import path from 'path';
 import type { TMessage } from '@/common/chat/chatLib';
 import type { TChatConversation } from '@/common/config/storage';
 import { getDatabase } from '@process/services/database';
@@ -28,10 +29,12 @@ import {
 } from '../plugins/dingtalk/DingTalkCards';
 import { convertHtmlToDingTalkMarkdown } from '../plugins/dingtalk/DingTalkAdapter';
 import { createMainMenuKeyboard, createToolConfirmationKeyboard } from '../plugins/telegram/TelegramKeyboards';
-import { escapeHtml } from '../plugins/telegram/TelegramAdapter';
+import { escapeHtml, markdownToTelegramHtml } from '../plugins/telegram/TelegramAdapter';
+import { stripHtml } from '../plugins/weixin/WeixinAdapter';
 import type { ChannelAgentType, IUnifiedIncomingMessage, IUnifiedOutgoingMessage, PluginType } from '../types';
 import type { PluginManager } from './PluginManager';
-import type { AcpBackend } from '@/common/types/acpTypes';
+import { buildChannelConversationExtra, resolveChannelSendProtocol } from '../utils';
+import i18n from '@process/services/i18n';
 
 // ==================== Platform-specific Helpers ====================
 
@@ -106,7 +109,25 @@ function formatTextForPlatform(text: string, platform: PluginType): string {
   if (platform === 'dingtalk') {
     return convertHtmlToDingTalkMarkdown(text);
   }
+  if (platform === 'telegram') {
+    return markdownToTelegramHtml(text);
+  }
+  if (platform === 'weixin') {
+    return stripHtml(text);
+  }
   return escapeHtml(text);
+}
+
+function buildRejectedChannelSendNotices(
+  rejectedActions: Array<{ path: string; fileName?: string; reason: string }>
+): string[] {
+  return rejectedActions.map((action) => {
+    const name = action.fileName || path.basename(action.path);
+    if (action.reason === 'outside_allowed') {
+      return i18n.t('settings.channels.mediaPathNotAllowed', { name });
+    }
+    return i18n.t('settings.channels.mediaSendFailed', { name });
+  });
 }
 
 /**
@@ -220,6 +241,16 @@ function convertTMessageToOutgoing(
       // Check if there are tools that need confirmation
       const confirmingTool = message.content.find((tool) => tool.status === 'Confirming' && tool.confirmationDetails);
       if (confirmingTool && confirmingTool.confirmationDetails) {
+        // WeChat (weixin) uses yoloMode — tool confirmations are auto-approved in the background.
+        // Showing "Continue?" without interactive buttons is confusing, so just show tool progress.
+        if (platform === 'weixin') {
+          return {
+            type: 'text',
+            text: toolLines.join('\n') || '⏳ 正在执行工具...',
+            parseMode: 'HTML',
+          };
+        }
+
         // 根据确认类型生成选项
         // Generate options based on confirmation type
         const options = getConfirmationOptions(confirmingTool.confirmationDetails.type);
@@ -380,16 +411,14 @@ export class ActionExecutor {
       // Get or create session (scoped by chatId for per-chat isolation)
       let session = this.sessionManager.getSession(channelUser.id, chatId);
       if (!session || !session.conversationId) {
-        const source = platform === 'lark' ? 'lark' : platform === 'dingtalk' ? 'dingtalk' : 'telegram';
+        const source = platform;
 
         // Read selected agent for this platform (defaults to Gemini)
         let savedAgent: unknown = undefined;
         try {
-          savedAgent = await (platform === 'lark'
-            ? ProcessConfig.get('assistant.lark.agent')
-            : platform === 'dingtalk'
-              ? ProcessConfig.get('assistant.dingtalk.agent')
-              : ProcessConfig.get('assistant.telegram.agent'));
+          savedAgent = await ProcessConfig.get(
+            `assistant.${platform}.agent` as Parameters<typeof ProcessConfig.get>[0]
+          );
         } catch {
           // ignore
         }
@@ -411,6 +440,12 @@ export class ActionExecutor {
         // Map backend to conversation type for lookup
         const { convType, convBackend } = resolveChannelConvType(backend);
         const conversationName = getChannelConversationName(platform, convType, convBackend, chatId);
+        const conversationExtra = buildChannelConversationExtra({
+          platform,
+          backend,
+          customAgentId,
+          agentName,
+        });
 
         // Lookup existing conversation by source + chatId + type + backend (per-chat isolation)
         const db2 = await getDatabase();
@@ -427,16 +462,16 @@ export class ActionExecutor {
                 name: conversationName,
                 source,
                 channelChatId: chatId,
-                extra: {},
+                extra: conversationExtra,
               });
             } else if (backend === 'codex') {
               sessionConversation = await conversationServiceSingleton.createConversation({
-                type: 'codex',
+                type: 'acp',
                 model,
                 name: conversationName,
                 source,
                 channelChatId: chatId,
-                extra: {},
+                extra: { ...conversationExtra, backend: 'codex' },
               });
             } else if (backend === 'openclaw-gateway') {
               sessionConversation = await conversationServiceSingleton.createConversation({
@@ -445,7 +480,7 @@ export class ActionExecutor {
                 name: conversationName,
                 source,
                 channelChatId: chatId,
-                extra: {},
+                extra: conversationExtra,
               });
             } else {
               sessionConversation = await conversationServiceSingleton.createConversation({
@@ -454,11 +489,7 @@ export class ActionExecutor {
                 name: conversationName,
                 source,
                 channelChatId: chatId,
-                extra: {
-                  backend: backend as AcpBackend,
-                  customAgentId,
-                  agentName,
-                },
+                extra: conversationExtra,
               });
             }
           } catch (error) {
@@ -722,11 +753,30 @@ export class ActionExecutor {
       // After stream ends, update last message with action buttons (keep original content)
       const lastMsgId = sentMessageIds[sentMessageIds.length - 1] || thinkingMsgId;
       try {
+        const finalizedMessage =
+          context.platform === 'weixin' && context.conversationId && lastMessageContent?.text !== undefined
+            ? await resolveChannelSendProtocol(lastMessageContent.text, context.conversationId)
+            : null;
+        const finalVisibleText = finalizedMessage
+          ? [finalizedMessage.visibleText, ...buildRejectedChannelSendNotices(finalizedMessage.rejectedActions)]
+              .filter(Boolean)
+              .join('\n\n')
+          : lastMessageContent?.text;
+
         // 使用最后一条消息的实际内容，添加操作按钮（根据平台）
         // Use actual content of last message, add action buttons (based on platform)
-        const responseMarkup = getResponseActionsMarkup(context.platform as PluginType, lastMessageContent?.text);
+        const responseMarkup = getResponseActionsMarkup(context.platform as PluginType, finalVisibleText);
         const finalMessage: IUnifiedOutgoingMessage = lastMessageContent
-          ? { ...lastMessageContent, replyMarkup: responseMarkup }
+          ? {
+              ...lastMessageContent,
+              ...(finalizedMessage
+                ? {
+                    text: finalVisibleText,
+                    mediaActions: finalizedMessage.mediaActions,
+                  }
+                : {}),
+              replyMarkup: responseMarkup,
+            }
           : {
               type: 'text',
               text: '✅ Done',

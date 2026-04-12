@@ -3,6 +3,7 @@ import { uuid } from '@/common/utils';
 import { useAutoTitle } from '@/renderer/hooks/chat/useAutoTitle';
 import { useLatestRef } from '@/renderer/hooks/ui/useLatestRef';
 import { useAddOrUpdateMessage } from '@/renderer/pages/conversation/Messages/hooks';
+import { assertBridgeSuccess } from '@/renderer/pages/conversation/platforms/assertBridgeSuccess';
 import { emitter } from '@/renderer/utils/emitter';
 import { useEffect } from 'react';
 
@@ -43,12 +44,12 @@ export const useGeminiInitialMessage = ({
 
     if (!storedMessage) return;
 
-    // If no auth, store message in input box and trigger auto-detection from this new message point
+    // If no auth, store message in input box and trigger auto-detection from this new message point.
+    // Keep sessionStorage intact so auth loading later can pick it up and send.
     if (hasNoAuth) {
       try {
         const { input } = JSON.parse(storedMessage) as { input: string };
         setContent(input);
-        sessionStorage.removeItem(storageKey);
       } catch {
         // Ignore parse errors
       }
@@ -70,6 +71,9 @@ export const useGeminiInitialMessage = ({
       try {
         const { input, files } = JSON.parse(storedMessage) as { input: string; files?: string[] };
 
+        // Clear input box content (may have been placed there during hasNoAuth phase)
+        setContent('');
+
         const msg_id = uuid();
         setActiveMsgId(msg_id);
         setWaitingResponse(true); // Set waiting state immediately to show stop button
@@ -90,14 +94,15 @@ export const useGeminiInitialMessage = ({
         );
 
         // Send message to backend
-        await ipcBridge.geminiConversation.sendMessage.invoke({
+        void checkAndUpdateTitle(conversationId, input);
+        const result = await ipcBridge.geminiConversation.sendMessage.invoke({
           input,
           msg_id,
           conversation_id: conversationId,
           files: files || [],
         });
+        assertBridgeSuccess(result, 'Failed to send initial message to Gemini');
 
-        void checkAndUpdateTitle(conversationId, input);
         emitter.emit('chat.history.refresh');
         if (files && files.length > 0) {
           emitter.emit('gemini.workspace.refresh');
@@ -108,5 +113,5 @@ export const useGeminiInitialMessage = ({
     };
 
     void sendInitialMessage();
-  }, [conversationId, currentModelId]);
+  }, [conversationId, currentModelId, hasNoAuth]);
 };

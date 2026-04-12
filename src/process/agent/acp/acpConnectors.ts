@@ -25,41 +25,146 @@ import {
 import {
   findSuitableNodeBin,
   getEnhancedEnv,
+  getNpxCacheDir,
   getWindowsShellExecutionOptions,
+  loadFullShellEnvironment,
+  resolveNpxDirect,
   resolveNpxPath,
 } from '@process/utils/shellEnv';
-import { mainLog, mainWarn } from '@process/utils/mainLogger';
+import { mainWarn } from '@process/utils/mainLogger';
 
 const execFile = promisify(execFileCb);
 
 /** Enable ACP performance diagnostics via ACP_PERF=1 */
 export const ACP_PERF_LOG = process.env.ACP_PERF === '1';
 
+function normalizeWindowsCommand(command: string): string {
+  const trimmed = command.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function formatWindowsCommandForShell(command: string): string {
+  const normalized = normalizeWindowsCommand(command);
+  const isPathLike =
+    /^[a-zA-Z]:[\\/]/.test(normalized) ||
+    normalized.startsWith('.\\') ||
+    normalized.startsWith('..\\') ||
+    normalized.includes('\\') ||
+    normalized.includes('/');
+  return isPathLike ? `"${normalized}"` : normalized;
+}
+
+function resolveCodexAcpPlatformPackage(): string | null {
+  if (process.platform === 'win32') {
+    if (process.arch === 'x64') {
+      return '@zed-industries/codex-acp-win32-x64';
+    }
+
+    if (process.arch === 'arm64') {
+      return '@zed-industries/codex-acp-win32-arm64';
+    }
+  }
+
+  if (process.platform === 'linux') {
+    if (process.arch === 'x64') {
+      return '@zed-industries/codex-acp-linux-x64';
+    }
+
+    if (process.arch === 'arm64') {
+      return '@zed-industries/codex-acp-linux-arm64';
+    }
+  }
+
+  if (process.platform === 'darwin') {
+    if (process.arch === 'x64') {
+      return '@zed-industries/codex-acp-darwin-x64';
+    }
+
+    if (process.arch === 'arm64') {
+      return '@zed-industries/codex-acp-darwin-arm64';
+    }
+  }
+
+  return null;
+}
+
+function resolveCodexAcpPlatformPackageSpecifier(packageName: string): string {
+  return process.platform === 'win32' ? `${packageName}@${CODEX_ACP_BRIDGE_VERSION}` : packageName;
+}
+
+function resolvePreferredCodexAcpPlatformPackage(): string | null {
+  const packageName = resolveCodexAcpPlatformPackage();
+  return packageName ? resolveCodexAcpPlatformPackageSpecifier(packageName) : null;
+}
+
+function shouldPreferDirectCodexAcpPackage(): boolean {
+  return process.platform === 'win32' || process.platform === 'linux';
+}
+
+function extractCodexPlatformPackageFromError(errorMessage: string): string | null {
+  const packageMatch = errorMessage.match(/Cannot find package '(@zed-industries\/codex-acp-[^']+)'/i);
+  if (packageMatch) {
+    return packageMatch[1];
+  }
+
+  const binaryMatch = errorMessage.match(/Failed to locate (@zed-industries\/codex-acp-[^\s]+) binary/i);
+  if (binaryMatch) {
+    return binaryMatch[1];
+  }
+
+  return null;
+}
+
+function isCodexMetaPackageOptionalDependencyError(errorMessage: string): boolean {
+  return (
+    errorMessage.includes('optional dependency was not installed') ||
+    (errorMessage.includes('@zed-industries/codex-acp') &&
+      /ERR_MODULE_NOT_FOUND|Cannot find package|Failed to locate .* binary/i.test(errorMessage))
+  );
+}
+
 // ── Environment helpers ─────────────────────────────────────────────
 
 /**
  * Prepare a clean environment for ACP backends.
- * Removes Electron-injected NODE_OPTIONS, npm lifecycle vars, and other
- * env vars that interfere with child Node.js processes.
+ *
+ * Merges the full user shell environment (including custom env vars like
+ * API keys exported in .zshrc) with the enhanced env (PATH merging,
+ * bundled tool paths). Then removes Electron-injected NODE_OPTIONS,
+ * npm lifecycle vars, and other env vars that interfere with child
+ * Node.js processes.
  */
-export function prepareCleanEnv(): Record<string, string | undefined> {
+export async function prepareCleanEnv(): Promise<Record<string, string | undefined>> {
+  const fullShellEnv = await loadFullShellEnvironment();
   const cleanEnv = getEnhancedEnv();
-  delete cleanEnv.NODE_OPTIONS;
-  delete cleanEnv.NODE_INSPECT;
-  delete cleanEnv.NODE_DEBUG;
+
+  // Merge full shell env as base, then overlay getEnhancedEnv on top
+  // so that PATH merging and bundled bun injection are preserved,
+  // while user-defined vars (e.g. SSS_API_KEY) from .zshrc are included.
+  const merged: Record<string, string | undefined> = {
+    ...fullShellEnv,
+    ...cleanEnv,
+  };
+
+  delete merged.NODE_OPTIONS;
+  delete merged.NODE_INSPECT;
+  delete merged.NODE_DEBUG;
   // Remove CLAUDECODE env var to prevent claude-agent-sdk from detecting
   // a nested session when AionUi itself is launched from Claude Code.
-  delete cleanEnv.CLAUDECODE;
+  delete merged.CLAUDECODE;
   // Strip npm lifecycle vars inherited from parent `npm start` process.
   // These (npm_config_*, npm_lifecycle_*, npm_package_*) can cause npx to
   // behave as if running inside an npm script, interfering with package
   // resolution and child process startup.
-  for (const key of Object.keys(cleanEnv)) {
+  for (const key of Object.keys(merged)) {
     if (key.startsWith('npm_')) {
-      delete cleanEnv[key];
+      delete merged[key];
     }
   }
-  return cleanEnv;
+  return merged;
 }
 
 /**
@@ -112,9 +217,7 @@ export function ensureMinNodeVersion(
           timeout: 5000,
           stdio: ['pipe', 'pipe', 'pipe'],
         }).trim();
-        console.log(
-          `[ACP] Node.js ${detectedVersion} is below v${minMajor}.${minMinor}.0 — auto-corrected to ${correctedVersion} from: ${suitableBinDir}`
-        );
+        // Version auto-corrected silently
       } catch {
         console.warn(`[ACP] PATH corrected with ${suitableBinDir} but node verification failed — proceeding anyway`);
       }
@@ -203,6 +306,11 @@ export type SpawnResult = { child: ChildProcess; isDetached: boolean };
 export type NpxPrepareResult = {
   cleanEnv: Record<string, string | undefined>;
   npxCommand: string;
+  /**
+   * Windows-only: absolute paths for direct `node.exe npx-cli.js` invocation,
+   * bypassing `.cmd` shims whose `%~dp0` can resolve to the wrong directory.
+   */
+  directInvoke?: { nodePath: string; npxScript: string };
   extraArgs?: string[];
 };
 
@@ -220,7 +328,16 @@ export function spawnNpxBackend(
   workingDir: string,
   isWindows: boolean,
   preferOffline: boolean,
-  { extraArgs = [], detached = false }: { extraArgs?: string[]; detached?: boolean } = {}
+  {
+    extraArgs = [],
+    detached = false,
+    directInvoke,
+  }: {
+    extraArgs?: string[];
+    detached?: boolean;
+    /** Windows: bypass .cmd shims with direct node.exe + npx-cli.js invocation */
+    directInvoke?: { nodePath: string; npxScript: string };
+  } = {}
 ): SpawnResult {
   const spawnArgs = ['--yes', ...(preferOffline ? ['--prefer-offline'] : []), npxPackage, ...extraArgs];
 
@@ -229,7 +346,16 @@ export function spawnNpxBackend(
   // Required for backends (e.g. CodeBuddy) that write to /dev/tty — without it, SIGTTOU
   // would suspend the entire Electron process group and freeze the UI.
   // On Windows, prefix with chcp 65001 to switch console to UTF-8, preventing GBK garbling.
-  const effectiveCommand = isWindows ? `chcp 65001 >nul && "${npxCommand}"` : npxCommand;
+  let effectiveCommand: string;
+  if (isWindows && directInvoke) {
+    // Bypass .cmd shims: invoke node.exe with npx-cli.js directly.
+    // .cmd batch files use %~dp0 to resolve sibling paths — this can break when the
+    // working directory or Node.js version manager shims interfere with path resolution,
+    // producing "Cannot find module '<cwd>\node_modules\npm\bin\npm-cli.js'" errors.
+    effectiveCommand = `chcp 65001 >nul && "${directInvoke.nodePath}" "${directInvoke.npxScript}"`;
+  } else {
+    effectiveCommand = isWindows ? `chcp 65001 >nul && ${formatWindowsCommandForShell(npxCommand)}` : npxCommand;
+  }
   const child = spawn(effectiveCommand, spawnArgs, {
     cwd: workingDir,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -249,15 +375,15 @@ export function spawnNpxBackend(
 }
 
 /** Prepare clean env + resolve npx for Claude ACP bridge. */
-function prepareClaude(): NpxPrepareResult {
-  const cleanEnv = prepareCleanEnv();
+async function prepareClaude(): Promise<NpxPrepareResult> {
+  const cleanEnv = await prepareCleanEnv();
   ensureMinNodeVersion(cleanEnv, 20, 10, 'Claude ACP bridge');
-  return { cleanEnv, npxCommand: resolveNpxPath(cleanEnv) };
+  return { cleanEnv, npxCommand: resolveNpxPath(cleanEnv), directInvoke: resolveNpxDirect(cleanEnv) ?? undefined };
 }
 
 /** Prepare clean env + resolve npx + run diagnostics for Codex ACP bridge. */
-async function prepareCodex(): Promise<NpxPrepareResult> {
-  const cleanEnv = prepareCleanEnv();
+async function prepareCodex(codexAcpPackage: string = CODEX_ACP_NPX_PACKAGE): Promise<NpxPrepareResult> {
+  const cleanEnv = await prepareCleanEnv();
   ensureMinNodeVersion(cleanEnv, 20, 10, 'Codex ACP bridge');
 
   const codexCommand = process.platform === 'win32' ? 'codex.cmd' : 'codex';
@@ -277,7 +403,7 @@ async function prepareCodex(): Promise<NpxPrepareResult> {
     hasChatGptSession: boolean;
   } = {
     bridgeVersion: CODEX_ACP_BRIDGE_VERSION,
-    bridgePackage: CODEX_ACP_NPX_PACKAGE,
+    bridgePackage: codexAcpPackage,
     codexCliVersion: 'unknown',
     loginStatus: 'unknown',
     hasCodexApiKey: Boolean(cleanEnv.CODEX_API_KEY),
@@ -300,13 +426,62 @@ async function prepareCodex(): Promise<NpxPrepareResult> {
     mainWarn('[ACP codex]', 'Failed to read codex login status', error);
   }
 
-  mainLog('[ACP codex]', 'Runtime diagnostics', diagnostics);
-  return { cleanEnv, npxCommand: resolveNpxPath(cleanEnv) };
+  return { cleanEnv, npxCommand: resolveNpxPath(cleanEnv), directInvoke: resolveNpxDirect(cleanEnv) ?? undefined };
+}
+
+async function resolveCachedCodexAcpBinary(): Promise<{ binaryPath: string; packageSpecifier: string } | null> {
+  const packageName = resolveCodexAcpPlatformPackage();
+  if (!packageName) {
+    return null;
+  }
+
+  const packageDirName = packageName.replace('@zed-industries/', '');
+  const binaryName = process.platform === 'win32' ? 'codex-acp.exe' : 'codex-acp';
+  const npxCacheDir = getNpxCacheDir();
+
+  let entries: string[] = [];
+  try {
+    entries = await fs.readdir(npxCacheDir);
+  } catch {
+    return null;
+  }
+
+  let selectedBinaryPath: string | null = null;
+  let selectedMtimeMs = -1;
+
+  for (const entry of entries) {
+    const candidatePath = path.join(
+      npxCacheDir,
+      entry,
+      'node_modules',
+      '@zed-industries',
+      packageDirName,
+      'bin',
+      binaryName
+    );
+
+    try {
+      const stat = await fs.stat(candidatePath);
+      if (stat.isFile() && stat.mtimeMs > selectedMtimeMs) {
+        selectedBinaryPath = candidatePath;
+        selectedMtimeMs = stat.mtimeMs;
+      }
+    } catch {
+      // Ignore cache entries that do not contain this package.
+    }
+  }
+
+  return selectedBinaryPath
+    ? {
+        binaryPath: selectedBinaryPath,
+        packageSpecifier: resolveCodexAcpPlatformPackageSpecifier(packageName),
+      }
+    : null;
 }
 
 /** Prepare clean env + resolve npx + load MCP config for CodeBuddy. */
 async function prepareCodebuddy(): Promise<NpxPrepareResult> {
-  const cleanEnv = prepareCleanEnv();
+  const cleanEnv = await prepareCleanEnv();
   ensureMinNodeVersion(cleanEnv, 20, 10, 'CodeBuddy ACP');
 
   // Load user's MCP config if available (~/.codebuddy/mcp.json)
@@ -316,12 +491,16 @@ async function prepareCodebuddy(): Promise<NpxPrepareResult> {
   try {
     await fs.access(mcpConfigPath);
     extraArgs.push('--mcp-config', mcpConfigPath);
-    mainLog('[ACP]', `Loading CodeBuddy MCP config from ${mcpConfigPath}`);
   } catch {
     mainWarn('[ACP]', 'No CodeBuddy MCP config found, starting without MCP servers');
   }
 
-  return { cleanEnv, npxCommand: resolveNpxPath(cleanEnv), extraArgs };
+  return {
+    cleanEnv,
+    npxCommand: resolveNpxPath(cleanEnv),
+    directInvoke: resolveNpxDirect(cleanEnv) ?? undefined,
+    extraArgs,
+  };
 }
 
 /**
@@ -343,18 +522,25 @@ export async function spawnGenericBackend(
     // best-effort: if mkdir fails, let spawn report the actual error
   }
 
-  const cleanEnv = prepareCleanEnv();
+  const cleanEnv = await prepareCleanEnv();
   if (customEnv) {
     Object.assign(cleanEnv, customEnv);
   }
   ensureMinNodeVersion(cleanEnv, 18, 17, `${backend} ACP`);
 
   const spawnStart = Date.now();
+  const detached = process.platform !== 'win32';
   const config = createGenericSpawnConfig(cliPath, workingDir, acpArgs, undefined, cleanEnv as Record<string, string>);
-  const child = spawn(config.command, config.args, config.options);
+  const child = spawn(config.command, config.args, {
+    ...config.options,
+    detached,
+  });
+  if (detached) {
+    child.unref();
+  }
   if (ACP_PERF_LOG) console.log(`[ACP-PERF] connect: ${backend} process spawned ${Date.now() - spawnStart}ms`);
 
-  return { child, isDetached: false };
+  return { child, isDetached: detached };
 }
 
 /** Callbacks for wiring a spawned child into the AcpConnection instance. */
@@ -385,13 +571,14 @@ async function connectNpxBackend(config: {
   const { backend, npxPackage, prepareFn, workingDir, setup, cleanup } = config;
 
   const envStart = Date.now();
-  const { cleanEnv, npxCommand, extraArgs: prepExtraArgs = [] } = await prepareFn();
+  const { cleanEnv, npxCommand, directInvoke, extraArgs: prepExtraArgs = [] } = await prepareFn();
   if (ACP_PERF_LOG) console.log(`[ACP-PERF] ${backend}: env prepared ${Date.now() - envStart}ms`);
 
   const isWindows = process.platform === 'win32';
   const opts = {
     extraArgs: [...(config.extraArgs ?? []), ...prepExtraArgs],
     detached: config.detached ?? false,
+    directInvoke,
   };
 
   // Phase 1: Try with --prefer-offline for fast startup
@@ -420,18 +607,100 @@ export function connectClaude(workingDir: string, hooks: NpxConnectHooks): Promi
     prepareFn: prepareClaude,
     workingDir,
     ...hooks,
+    detached: process.platform !== 'win32',
   });
 }
 
 /** Connect to Codex ACP bridge via npx. */
 export function connectCodex(workingDir: string, hooks: NpxConnectHooks): Promise<void> {
-  return connectNpxBackend({
-    backend: 'codex',
-    npxPackage: CODEX_ACP_NPX_PACKAGE,
-    prepareFn: prepareCodex,
-    workingDir,
-    ...hooks,
-  });
+  return (async () => {
+    const cachedBinary = await resolveCachedCodexAcpBinary();
+    if (cachedBinary) {
+      try {
+        const { cleanEnv } = await prepareCodex(cachedBinary.packageSpecifier);
+        const config = createGenericSpawnConfig(
+          cachedBinary.binaryPath,
+          workingDir,
+          [],
+          undefined,
+          cleanEnv as Record<string, string>
+        );
+        const child = spawn(config.command, config.args, config.options);
+        await hooks.setup({ child, isDetached: false });
+        return;
+      } catch (error) {
+        await hooks.cleanup();
+        mainWarn(
+          '[ACP codex]',
+          `Cached platform binary failed, falling back to package resolution: ${cachedBinary.packageSpecifier}`,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+
+    const codexPlatformPackage = resolvePreferredCodexAcpPlatformPackage();
+    const preferDirectPackage = codexPlatformPackage !== null && shouldPreferDirectCodexAcpPackage();
+    const codexPackageCandidates = preferDirectPackage
+      ? [codexPlatformPackage, CODEX_ACP_NPX_PACKAGE]
+      : [CODEX_ACP_NPX_PACKAGE, ...(codexPlatformPackage ? [codexPlatformPackage] : [])];
+
+    let lastError: Error | null = null;
+
+    for (const [index, npxPackage] of codexPackageCandidates.entries()) {
+      try {
+        await connectNpxBackend({
+          backend: 'codex',
+          npxPackage,
+          prepareFn: () => prepareCodex(npxPackage),
+          workingDir,
+          ...hooks,
+        });
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        const fallbackPackageName = extractCodexPlatformPackageFromError(lastError.message);
+        const fallbackPackage = fallbackPackageName
+          ? resolveCodexAcpPlatformPackageSpecifier(fallbackPackageName)
+          : null;
+        const canRetryWithPlatformPackage =
+          index === 0 &&
+          !preferDirectPackage &&
+          codexPlatformPackage !== null &&
+          npxPackage === CODEX_ACP_NPX_PACKAGE &&
+          isCodexMetaPackageOptionalDependencyError(lastError.message);
+        const hasRemainingCandidates = index < codexPackageCandidates.length - 1;
+
+        await hooks.cleanup();
+
+        if (canRetryWithPlatformPackage) {
+          if (fallbackPackage && !codexPackageCandidates.includes(fallbackPackage)) {
+            codexPackageCandidates.push(fallbackPackage);
+          }
+
+          mainWarn(
+            '[ACP codex]',
+            `Meta bridge package failed to install its platform binary, retrying with direct package: ${codexPlatformPackage}`,
+            lastError.message
+          );
+          continue;
+        }
+
+        if (hasRemainingCandidates) {
+          mainWarn(
+            '[ACP codex]',
+            `Bridge package failed, retrying alternate package: ${npxPackage}`,
+            lastError.message
+          );
+          continue;
+        }
+
+        throw lastError;
+      }
+    }
+
+    throw lastError ?? new Error('Failed to start codex ACP bridge');
+  })();
 }
 
 /** Connect to CodeBuddy ACP via npx. */

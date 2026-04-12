@@ -5,26 +5,74 @@ import { SettingsViewModeProvider } from '@/renderer/components/settings/Setting
 import { isElectronDesktop, resolveExtensionAssetUrl } from '@/renderer/utils/platform';
 import { extensions as extensionsIpc, type IExtensionSettingsTab } from '@/common/adapter/ipcBridge';
 import {
+  Cat,
   Communication,
   Computer,
   Earth,
   Gemini,
   Info,
+  Lightning,
   LinkCloud,
   Puzzle,
   Robot,
   System,
-  Toolkit,
 } from '@icon-park/react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useExtI18n } from '@/renderer/hooks/system/useExtI18n';
+import { BUILTIN_TAB_IDS, LEGACY_ANCHOR_REMAP } from './SettingsSider';
 import './settings.css';
 
 interface SettingsPageWrapperProps {
   children: React.ReactNode;
   className?: string;
   contentClassName?: string;
+}
+
+type NavItem = { label: string; icon: React.ReactElement; path: string; id: string };
+
+type TranslateFn = (key: string, options?: { defaultValue?: string }) => string;
+
+export function getBuiltinSettingsNavItems(isDesktop: boolean, t: TranslateFn): NavItem[] {
+  const builtinMap: Record<string, NavItem> = {
+    gemini: { id: 'gemini', label: t('settings.gemini'), icon: <Gemini theme='outline' size='16' />, path: 'gemini' },
+    model: { id: 'model', label: t('settings.model'), icon: <LinkCloud theme='outline' size='16' />, path: 'model' },
+    assistants: {
+      id: 'assistants',
+      label: t('settings.assistants', { defaultValue: 'Assistants' }),
+      icon: <Robot theme='outline' size='16' />,
+      path: 'assistants',
+    },
+    agent: {
+      id: 'agent',
+      label: t('settings.agents', { defaultValue: 'Agents' }),
+      icon: <Robot theme='outline' size='16' />,
+      path: 'agent',
+    },
+    capabilities: {
+      id: 'capabilities',
+      label: t('settings.capabilities', { defaultValue: 'Capabilities' }),
+      icon: <Lightning theme='outline' size='16' />,
+      path: 'capabilities',
+    },
+    display: {
+      id: 'display',
+      label: t('settings.display'),
+      icon: <Computer theme='outline' size='16' />,
+      path: 'display',
+    },
+    webui: {
+      id: 'webui',
+      label: t('settings.webui'),
+      icon: isDesktop ? <Earth theme='outline' size='16' /> : <Communication theme='outline' size='16' />,
+      path: 'webui',
+    },
+    pet: { id: 'pet', label: t('pet.desktopPet'), icon: <Cat theme='outline' size='16' />, path: 'pet' },
+    system: { id: 'system', label: t('settings.system'), icon: <System theme='outline' size='16' />, path: 'system' },
+    about: { id: 'about', label: t('settings.about'), icon: <Info theme='outline' size='16' />, path: 'about' },
+  };
+
+  return BUILTIN_TAB_IDS.map((id) => builtinMap[id]);
 }
 
 const SettingsPageWrapper: React.FC<SettingsPageWrapperProps> = ({ children, className, contentClassName }) => {
@@ -46,29 +94,8 @@ const SettingsPageWrapper: React.FC<SettingsPageWrapperProps> = ({ children, cla
 
   const { resolveExtTabName } = useExtI18n();
 
-  type NavItem = { label: string; icon: React.ReactElement; path: string; id: string };
-
   const menuItems = React.useMemo(() => {
-    const builtins: NavItem[] = [
-      { id: 'gemini', label: t('settings.gemini'), icon: <Gemini theme='outline' size='16' />, path: 'gemini' },
-      { id: 'model', label: t('settings.model'), icon: <LinkCloud theme='outline' size='16' />, path: 'model' },
-      {
-        id: 'agent',
-        label: t('settings.assistants', { defaultValue: 'Assistants' }),
-        icon: <Robot theme='outline' size='16' />,
-        path: 'agent',
-      },
-      { id: 'tools', label: t('settings.tools'), icon: <Toolkit theme='outline' size='16' />, path: 'tools' },
-      { id: 'display', label: t('settings.display'), icon: <Computer theme='outline' size='16' />, path: 'display' },
-      {
-        id: 'webui',
-        label: t('settings.webui'),
-        icon: isDesktop ? <Earth theme='outline' size='16' /> : <Communication theme='outline' size='16' />,
-        path: 'webui',
-      },
-      { id: 'system', label: t('settings.system'), icon: <System theme='outline' size='16' />, path: 'system' },
-      { id: 'about', label: t('settings.about'), icon: <Info theme='outline' size='16' />, path: 'about' },
-    ];
+    const builtins = getBuiltinSettingsNavItems(isDesktop, t);
 
     // Insert extension tabs before system (unanchored default) or at anchor position
     const result = [...builtins];
@@ -81,11 +108,13 @@ const SettingsPageWrapper: React.FC<SettingsPageWrapperProps> = ({ children, cla
         unanchored.push(tab);
         continue;
       }
-      const map = tab.position.placement === 'before' ? beforeMap : afterMap;
-      let list = map.get(tab.position.anchor);
+      const { anchor: rawAnchor, placement } = tab.position;
+      const anchor = LEGACY_ANCHOR_REMAP[rawAnchor] ?? rawAnchor;
+      const map = placement === 'before' ? beforeMap : afterMap;
+      let list = map.get(anchor);
       if (!list) {
         list = [];
-        map.set(tab.position.anchor, list);
+        map.set(anchor, list);
       }
       list.push(tab);
     }

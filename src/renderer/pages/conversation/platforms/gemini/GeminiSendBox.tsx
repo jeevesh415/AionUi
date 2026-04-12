@@ -5,6 +5,7 @@ import ContextUsageIndicator from '@/renderer/components/agent/ContextUsageIndic
 import FilePreview from '@/renderer/components/media/FilePreview';
 import HorizontalFileList from '@/renderer/components/media/HorizontalFileList';
 import SendBox from '@/renderer/components/chat/sendbox';
+import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import { useAgentReadinessCheck } from '@/renderer/hooks/agent/useAgentReadinessCheck';
 import { useAutoTitle } from '@/renderer/hooks/chat/useAutoTitle';
 import { useLatestRef } from '@/renderer/hooks/ui/useLatestRef';
@@ -13,18 +14,26 @@ import FileAttachButton from '@/renderer/components/media/FileAttachButton';
 import { getSendBoxDraftHook, type FileOrFolderItem } from '@/renderer/hooks/chat/useSendBoxDraft';
 import { createSetUploadFile, useSendBoxFiles } from '@/renderer/hooks/chat/useSendBoxFiles';
 import { useSlashCommands } from '@/renderer/hooks/chat/useSlashCommands';
-import { useAddOrUpdateMessage } from '@/renderer/pages/conversation/Messages/hooks';
+import { useAddOrUpdateMessage, useRemoveMessageByMsgId } from '@/renderer/pages/conversation/Messages/hooks';
+import {
+  shouldEnqueueConversationCommand,
+  useConversationCommandQueue,
+  type ConversationCommandQueueItem,
+} from '@/renderer/pages/conversation/platforms/useConversationCommandQueue';
+import { assertBridgeSuccess } from '@/renderer/pages/conversation/platforms/assertBridgeSuccess';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
 import { allSupportedExts } from '@/renderer/services/FileService';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
 import { mergeFileSelectionItems } from '@/renderer/utils/file/fileSelection';
 import { buildDisplayMessage, collectSelectedFiles } from '@/renderer/utils/file/messageFiles';
 import { getModelContextLimit } from '@/renderer/utils/model/modelContextLimits';
-import { Tag } from '@arco-design/web-react';
+import { Message, Tag } from '@arco-design/web-react';
 import { Shield } from '@icon-park/react';
 import { iconColors } from '@/renderer/styles/colors';
 import AgentModeSelector from '@/renderer/components/agent/AgentModeSelector';
+import { useTeamPermission } from '@/renderer/pages/team/hooks/TeamPermissionContext';
 import ThoughtDisplay from '@/renderer/components/chat/ThoughtDisplay';
+import { useCommandQueueEnabled } from '@/renderer/hooks/system/useCommandQueueEnabled';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { GeminiModelSelection } from './useGeminiModelSelection';
@@ -50,8 +59,8 @@ const useSendBoxDraft = (conversation_id: string) => {
   const content = data?.content ?? '';
 
   const setAtPath = useCallback(
-    (atPath: Array<string | FileOrFolderItem>) => {
-      mutate((prev) => ({ ...prev, atPath }));
+    (nextAtPath: Array<string | FileOrFolderItem>) => {
+      mutate((prev) => ({ ...prev, atPath: nextAtPath }));
     },
     [data, mutate]
   );
@@ -59,8 +68,8 @@ const useSendBoxDraft = (conversation_id: string) => {
   const setUploadFile = createSetUploadFile(mutate, data);
 
   const setContent = useCallback(
-    (content: string) => {
-      mutate((prev) => ({ ...prev, content }));
+    (nextContent: string) => {
+      mutate((prev) => ({ ...prev, content: nextContent }));
     },
     [data, mutate]
   );
@@ -78,9 +87,14 @@ const useSendBoxDraft = (conversation_id: string) => {
 const GeminiSendBox: React.FC<{
   conversation_id: string;
   modelSelection: GeminiModelSelection;
-}> = ({ conversation_id, modelSelection }) => {
+  teamId?: string;
+  agentSlotId?: string;
+}> = ({ conversation_id, modelSelection, teamId, agentSlotId }) => {
   const [workspacePath, setWorkspacePath] = useState('');
   const { t } = useTranslation();
+  const teamPermission = useTeamPermission();
+  const isCommandQueueEnabled = useCommandQueueEnabled();
+  const showModeSelector = !teamPermission || teamPermission.isLeadAgent;
   const { checkAndUpdateTitle } = useAutoTitle();
 
   // Agent auto-detection state - only for new conversation + no auth scenario
@@ -117,10 +131,16 @@ const GeminiSendBox: React.FC<{
     handleSelectModel,
   });
 
-  const { thought, running, tokenUsage, setActiveMsgId, setWaitingResponse, resetState } = useGeminiMessage(
-    conversation_id,
-    handleGeminiError
-  );
+  const {
+    thought,
+    running,
+    hasHydratedRunningState,
+    tokenUsage,
+    setActiveMsgId,
+    setWaitingResponse,
+    resetState,
+    hasThinkingMessage,
+  } = useGeminiMessage(conversation_id, handleGeminiError);
 
   const { atPath, uploadFile, setAtPath, setUploadFile, content, setContent } = useSendBoxDraft(conversation_id);
 
@@ -171,7 +191,9 @@ const GeminiSendBox: React.FC<{
   const slashCommands = useSlashCommands(conversation_id);
 
   const addOrUpdateMessage = useAddOrUpdateMessage();
+  const removeMessageByMsgId = useRemoveMessageByMsgId();
   const { setSendBoxHandler } = usePreviewContext();
+  const isBusy = running;
 
   // Use useLatestRef to keep latest setters to avoid re-registering handler
   const setContentRef = useLatestRef(setContent);
@@ -203,51 +225,145 @@ const GeminiSendBox: React.FC<{
     setUploadFile,
   });
 
-  const onSendHandler = async (message: string) => {
-    if (!currentModel?.useModel) return;
+  const executeCommand = useCallback(
+    async ({ input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>) => {
+      if (!currentModel?.useModel) {
+        Message.warning(t('conversation.chat.noModelSelected'));
+        throw new Error('No model selected');
+      }
 
-    const msg_id = uuid();
-    // Set current active message ID to filter out events from old requests
-    setActiveMsgId(msg_id);
-    setWaitingResponse(true);
+      const msg_id = uuid();
+      setActiveMsgId(msg_id);
+      setWaitingResponse(true);
 
-    // Save file list before clearing
-    const filesToSend = collectSelectedFiles(uploadFile, atPath);
-    const hasFiles = filesToSend.length > 0;
+      const displayMessage = buildDisplayMessage(input, files, workspacePath);
 
-    // Content is already cleared by the shared SendBox component (setInput(''))
-    // before calling onSend — no need to clear again here.
-    clearFiles();
+      // In team mode, the backend writes the user message via IPC stream.
+      // Adding it here too would produce a duplicate bubble.
+      if (!teamId) {
+        addOrUpdateMessage(
+          {
+            id: msg_id,
+            type: 'text',
+            position: 'right',
+            conversation_id,
+            content: {
+              content: displayMessage,
+            },
+            createdAt: Date.now(),
+          },
+          true
+        );
+      }
 
-    // User message: Display in UI immediately (Backend will persist when receiving from IPC)
-    const displayMessage = buildDisplayMessage(message, filesToSend, workspacePath);
-    addOrUpdateMessage(
-      {
-        id: msg_id,
-        type: 'text',
-        position: 'right',
-        conversation_id,
-        content: {
-          content: displayMessage,
-        },
-        createdAt: Date.now(),
-      },
-      true
-    );
-    // Files are passed via files param, no longer adding @ prefix in message
-    await ipcBridge.geminiConversation.sendMessage.invoke({
-      input: displayMessage,
-      msg_id,
+      try {
+        void checkAndUpdateTitle(conversation_id, input);
+        if (teamId) {
+          if (agentSlotId) {
+            const result = await ipcBridge.team.sendMessageToAgent.invoke({
+              teamId,
+              slotId: agentSlotId,
+              content: displayMessage,
+            });
+            const maybeError = result as unknown as { __bridgeError?: boolean; message?: string };
+            if (maybeError.__bridgeError) {
+              throw new Error(maybeError.message || 'Failed to send message to agent');
+            }
+          } else {
+            const result = await ipcBridge.team.sendMessage.invoke({ teamId, content: displayMessage });
+            const maybeError = result as unknown as { __bridgeError?: boolean; message?: string };
+            if (maybeError.__bridgeError) {
+              throw new Error(maybeError.message || 'Failed to send message to team');
+            }
+          }
+        } else {
+          const result = await ipcBridge.geminiConversation.sendMessage.invoke({
+            input: displayMessage,
+            msg_id,
+            conversation_id,
+            files,
+          });
+          assertBridgeSuccess(result, 'Failed to send message to Gemini');
+        }
+        emitter.emit('chat.history.refresh');
+        if (files.length > 0) {
+          emitter.emit('gemini.workspace.refresh');
+        }
+      } catch (error) {
+        removeMessageByMsgId(msg_id);
+        throw error;
+      }
+    },
+    [
+      addOrUpdateMessage,
+      agentSlotId,
+      checkAndUpdateTitle,
       conversation_id,
-      files: filesToSend,
-    });
-    void checkAndUpdateTitle(conversation_id, message);
-    emitter.emit('chat.history.refresh');
-    emitter.emit('gemini.selected.file.clear');
-    if (hasFiles) {
-      emitter.emit('gemini.workspace.refresh');
+      currentModel?.useModel,
+      setActiveMsgId,
+      removeMessageByMsgId,
+      setWaitingResponse,
+      teamId,
+      workspacePath,
+    ]
+  );
+
+  const {
+    items: queuedCommands,
+    isPaused: isQueuePaused,
+    isInteractionLocked: isQueueInteractionLocked,
+    hasPendingCommands,
+    enqueue,
+    remove,
+    clear,
+    reorder,
+    pause,
+    resume,
+    lockInteraction,
+    unlockInteraction,
+    resetActiveExecution,
+  } = useConversationCommandQueue({
+    conversationId: conversation_id,
+    enabled: isCommandQueueEnabled,
+    isBusy,
+    isHydrated: hasHydratedRunningState,
+    onExecute: executeCommand,
+  });
+
+  const onSendHandler = async (message: string) => {
+    if (!teamId && !isCommandQueueEnabled && isBusy) {
+      Message.warning(t('messages.conversationInProgress'));
+      return;
     }
+
+    const filesToSend = collectSelectedFiles(uploadFile, atPath);
+    clearFiles();
+    emitter.emit('gemini.selected.file.clear');
+
+    if (
+      shouldEnqueueConversationCommand({
+        enabled: isCommandQueueEnabled,
+        isBusy,
+        hasPendingCommands,
+      })
+    ) {
+      enqueue({ input: message, files: filesToSend });
+      return;
+    }
+
+    await executeCommand({ input: message, files: filesToSend });
   };
+
+  const handleEditQueuedCommand = useCallback(
+    (item: ConversationCommandQueueItem) => {
+      remove(item.id);
+      setContent(item.input);
+      setUploadFile(Array.from(new Set(item.files)));
+      setAtPath([]);
+      emitter.emit('gemini.selected.file.clear');
+    },
+    [remove, setAtPath, setContent, setUploadFile]
+  );
 
   const appendSelectedFiles = useCallback(
     (files: string[]) => {
@@ -260,8 +376,8 @@ const GeminiSendBox: React.FC<{
   });
 
   useAddEventListener('gemini.selected.file', setAtPath);
-  useAddEventListener('gemini.selected.file.append', (items: Array<string | FileOrFolderItem>) => {
-    const merged = mergeFileSelectionItems(atPathRef.current, items);
+  useAddEventListener('gemini.selected.file.append', (selectedItems: Array<string | FileOrFolderItem>) => {
+    const merged = mergeFileSelectionItems(atPathRef.current, selectedItems);
     if (merged !== atPathRef.current) {
       setAtPath(merged as Array<string | FileOrFolderItem>);
     }
@@ -274,6 +390,7 @@ const GeminiSendBox: React.FC<{
       await ipcBridge.conversation.stop.invoke({ conversation_id });
     } finally {
       resetState();
+      resetActiveExecution('stop');
     }
   };
 
@@ -296,12 +413,34 @@ const GeminiSendBox: React.FC<{
         />
       )}
 
-      <ThoughtDisplay thought={thought} running={running} onStop={handleStop} />
+      <CommandQueuePanel
+        items={queuedCommands}
+        paused={isQueuePaused}
+        interactionLocked={isQueueInteractionLocked}
+        onPause={pause}
+        onResume={resume}
+        onInteractionLock={lockInteraction}
+        onInteractionUnlock={unlockInteraction}
+        onEdit={handleEditQueuedCommand}
+        onReorder={reorder}
+        onRemove={remove}
+        onClear={clear}
+      />
+      <ThoughtDisplay
+        thought={hasThinkingMessage ? undefined : thought}
+        running={running && !hasThinkingMessage}
+        onStop={handleStop}
+      />
 
       <SendBox
         value={content}
         onChange={setContent}
-        loading={running}
+        selectedWorkspaceItems={atPath}
+        onSelectedWorkspaceItemsChange={(items) => {
+          emitter.emit('gemini.selected.file', items);
+          setAtPath(items);
+        }}
+        loading={isBusy}
         disabled={!currentModel?.useModel}
         placeholder={
           currentModel?.useModel
@@ -311,21 +450,25 @@ const GeminiSendBox: React.FC<{
         onStop={handleStop}
         className='z-10'
         onFilesAdded={handleFilesAdded}
+        hasPendingAttachments={uploadFile.length > 0 || atPath.length > 0}
         supportedExts={allSupportedExts}
         defaultMultiLine={true}
         lockMultiLine={true}
         tools={
           <div className='flex items-center gap-4px'>
             <FileAttachButton openFileSelector={openFileSelector} onLocalFilesAdded={handleFilesAdded} />
-            <AgentModeSelector
-              backend='gemini'
-              conversationId={conversation_id}
-              compact
-              compactLeadingIcon={<Shield theme='outline' size='14' fill={iconColors.secondary} />}
-              modeLabelFormatter={(mode) => t(`agentMode.${mode.value}`, { defaultValue: mode.label })}
-              compactLabelPrefix={t('agentMode.permission')}
-              hideCompactLabelPrefixOnMobile
-            />
+            {showModeSelector && (
+              <AgentModeSelector
+                backend='gemini'
+                conversationId={conversation_id}
+                compact
+                compactLeadingIcon={<Shield theme='outline' size='14' fill={iconColors.secondary} />}
+                modeLabelFormatter={(mode) => t(`agentMode.${mode.value}`, { defaultValue: mode.label })}
+                compactLabelPrefix={t('agentMode.permission')}
+                hideCompactLabelPrefixOnMobile
+                onModeChanged={teamPermission?.propagateMode}
+              />
+            )}
           </div>
         }
         sendButtonPrefix={
@@ -337,8 +480,7 @@ const GeminiSendBox: React.FC<{
         }
         prefix={
           <>
-            {/* Files on top */}
-            {(uploadFile.length > 0 || atPath.some((item) => (typeof item === 'string' ? true : item.isFile))) && (
+            {uploadFile.length > 0 && (
               <HorizontalFileList>
                 {uploadFile.map((path) => (
                   <FilePreview
@@ -347,29 +489,8 @@ const GeminiSendBox: React.FC<{
                     onRemove={() => setUploadFile(uploadFile.filter((v) => v !== path))}
                   />
                 ))}
-                {atPath.map((item) => {
-                  const isFile = typeof item === 'string' ? true : item.isFile;
-                  const path = typeof item === 'string' ? item : item.path;
-                  if (isFile) {
-                    return (
-                      <FilePreview
-                        key={path}
-                        path={path}
-                        onRemove={() => {
-                          const newAtPath = atPath.filter((v) =>
-                            typeof v === 'string' ? v !== path : v.path !== path
-                          );
-                          emitter.emit('gemini.selected.file', newAtPath);
-                          setAtPath(newAtPath);
-                        }}
-                      />
-                    );
-                  }
-                  return null;
-                })}
               </HorizontalFileList>
             )}
-            {/* Folder tags below */}
             {atPath.some((item) => (typeof item === 'string' ? false : !item.isFile)) && (
               <div className='flex flex-wrap items-center gap-8px mb-8px'>
                 {atPath.map((item) => {
@@ -399,6 +520,7 @@ const GeminiSendBox: React.FC<{
         onSend={onSendHandler}
         slashCommands={slashCommands}
         onSlashBuiltinCommand={onSlashBuiltinCommand}
+        allowSendWhileLoading={isCommandQueueEnabled}
       ></SendBox>
     </div>
   );

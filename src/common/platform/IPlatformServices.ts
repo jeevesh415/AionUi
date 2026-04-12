@@ -76,6 +76,12 @@ export interface IPowerManager {
   preventSleep(): number | null;
   /** id may be null (returned by standalone preventSleep); safe no-op in that case. */
   allowSleep(id: number | null): void;
+  /**
+   * Prevent the display (and system) from sleeping.
+   * Uses 'prevent-display-sleep' mode — stronger than preventSleep().
+   * Returns a handle ID, or null if not supported.
+   */
+  preventDisplaySleep(): number | null;
 }
 
 /**
@@ -89,10 +95,21 @@ export interface INotificationService {
   send(options: { title: string; body: string; icon?: string }): void;
 }
 
+/**
+ * Network primitives that vary by runtime.
+ *
+ * Electron should use `net.fetch()` to preserve Chromium networking behavior.
+ * Standalone server mode should use the runtime's global `fetch()`.
+ */
+export interface INetworkService {
+  fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
+}
+
 /** Top-level aggregate injected at process startup. */
 export interface IPlatformServices {
   paths: IPlatformPaths;
   worker: IWorkerProcessFactory;
   power: IPowerManager;
   notification: INotificationService;
+  network: INetworkService;
 }

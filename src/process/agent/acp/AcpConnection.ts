@@ -21,9 +21,7 @@ import { ACP_METHODS, JSONRPC_VERSION } from '@/common/types/acpTypes';
 import type { ChildProcess } from 'child_process';
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
-import { buildAcpModelInfo, summarizeAcpModelInfo } from './modelInfo';
 import type { AcpSessionMcpServer } from './mcpSessionConfig';
-import { mainLog } from '@process/utils/mainLogger';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -43,6 +41,56 @@ const execFile = promisify(execFileCb);
 
 // Re-export for unit tests that import from this module
 export { createGenericSpawnConfig } from './acpConnectors';
+
+/**
+ * Build a user-friendly error message for ACP startup failures.
+ * Detects known error patterns (CLI not found, config errors) and
+ * provides actionable guidance instead of raw stderr.
+ *
+ * Exported for unit testing.
+ */
+export function buildStartupErrorMessage(
+  backend: string,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  stderrCombined: string,
+  spawnErrorMessage: string | undefined,
+  resolvedBackend: string | null
+): string {
+  let errMsg: string;
+  if (stderrCombined) {
+    errMsg = `${backend} ACP process exited during startup (code: ${code}):\n${stderrCombined}`;
+  } else if (code === 0) {
+    // Exit code 0 with no stderr strongly suggests the CLI version does not support ACP mode
+    errMsg =
+      `${backend} ACP process exited during startup (code: 0). ` +
+      `This usually means the installed ${backend} CLI version does not support ACP mode. ` +
+      `Please upgrade to a newer version that supports ACP.`;
+  } else {
+    errMsg = `${backend} ACP process exited during startup (code: ${code}, signal: ${signal})`;
+  }
+
+  // Detect "command not found" patterns across platforms and provide a clear hint
+  if (
+    code !== 0 &&
+    /not recognized|not found|No such file|command not found|ENOENT/i.test(stderrCombined + (spawnErrorMessage ?? ''))
+  ) {
+    const cliHint = resolvedBackend ?? backend;
+    errMsg = `'${cliHint}' CLI not found. Please install it or update the CLI path in Settings.\n${stderrCombined}`;
+  }
+
+  // Detect CLI config loading errors and provide actionable guidance.
+  // e.g. Codex multi-agent config in config.toml that codex-acp cannot parse.
+  if (code !== 0 && /error loading config/i.test(stderrCombined)) {
+    const configPathMatch = stderrCombined.match(/error loading config:\s*([^\s:]+)/i);
+    const configHint = configPathMatch?.[1] ?? 'the CLI config file';
+    errMsg =
+      `${backend} CLI failed to start due to a config file error. ` +
+      `Please review or temporarily rename ${configHint} and try again.\n${stderrCombined}`;
+  }
+
+  return errMsg;
+}
 
 interface PendingRequest<T = unknown> {
   resolve: (value: T) => void;
@@ -68,6 +116,9 @@ export class AcpConnection {
   private configOptions: AcpSessionConfigOption[] | null = null;
   private models: AcpSessionModels | null = null;
 
+  // Configurable prompt timeout in milliseconds (default: 300000 = 5 minutes)
+  private promptTimeoutMs: number = 300000;
+
   // Performance tracking: timestamp when last prompt was sent
   private lastPromptSentAt: number = 0;
   private firstChunkReceived: boolean = true;
@@ -80,6 +131,15 @@ export class AcpConnection {
   public onPromptUsage: (usage: AcpPromptResponseUsage) => void = () => {}; // Handler for PromptResponse.usage (per-turn token data)
   public onFileOperation: (operation: { method: string; path: string; content?: string; sessionId: string }) => void =
     () => {};
+
+  /**
+   * Set the prompt timeout duration in seconds.
+   * @param seconds - Timeout in seconds (minimum 30, default 300)
+   */
+  setPromptTimeout(seconds: number): void {
+    this.promptTimeoutMs = Math.max(30, seconds) * 1000;
+  }
+
   // Disconnect callback - called when child process exits unexpectedly during runtime
   public onDisconnect: (error: { code: number | null; signal: NodeJS.Signals | null }) => void = () => {};
 
@@ -151,7 +211,7 @@ export class AcpConnection {
       if (AcpConnection.NPX_BACKENDS.has(backend) && /notarget|no matching version/i.test(errMsg)) {
         console.warn(`[ACP] Detected stale npm cache for ${backend}, cleaning and retrying...`);
         try {
-          const cleanEnv = prepareCleanEnv();
+          const cleanEnv = await prepareCleanEnv();
           const npmPath = resolveNpxPath(cleanEnv)
             .replace(/npx$/, 'npm')
             .replace(/npx\.cmd$/, 'npm.cmd');
@@ -245,6 +305,8 @@ export class AcpConnection {
       case 'qoder':
       case 'vibe':
       case 'cursor':
+      case 'kiro':
+      case 'hermes':
         if (!cliPath) {
           throw new Error(`CLI path is required for ${backend} backend`);
         }
@@ -312,6 +374,10 @@ export class AcpConnection {
     const processExitPromise = new Promise<never>((_resolve, reject) => {
       processExitReject = reject;
     });
+    // Eagerly attach a no-op rejection handler so that if the process fails
+    // before we reach Promise.race (e.g. ENOENT from a missing CLI binary),
+    // the rejection does not become an unhandled promise rejection.
+    processExitPromise.catch(() => {});
 
     // Exit handler for both startup and runtime phases
     child.on('exit', (code, signal) => {
@@ -324,22 +390,14 @@ export class AcpConnection {
         // Combine head + tail, deduplicating any overlap
         const stderrCombined =
           stderrHead + (stderrTail && !stderrHead.endsWith(stderrTail) ? '\n…\n' + stderrTail : '');
-        let errMsg: string;
-        if (stderrCombined) {
-          errMsg = `${backend} ACP process exited during startup (code: ${code}):\n${stderrCombined}`;
-        } else {
-          errMsg = `${backend} ACP process exited during startup (code: ${code}, signal: ${signal})`;
-        }
-        // Detect "command not found" patterns across platforms and provide a clear hint
-        if (
-          code !== 0 &&
-          /not recognized|not found|No such file|command not found|ENOENT/i.test(
-            stderrCombined + (spawnError?.message ?? '')
-          )
-        ) {
-          const cliHint = this.backend ?? backend;
-          errMsg = `'${cliHint}' CLI not found. Please install it or update the CLI path in Settings.\n${stderrCombined}`;
-        }
+        const errMsg = buildStartupErrorMessage(
+          backend,
+          code,
+          signal,
+          stderrCombined,
+          spawnError?.message,
+          this.backend
+        );
         if (code !== 0 && !spawnError) {
           spawnError = new Error(errMsg);
         }
@@ -407,10 +465,7 @@ export class AcpConnection {
       ]);
     } finally {
       // Neutralize processExitReject so later exits won't call a stale reject.
-      // Attach .catch only now — prevents unhandled rejection if the process exits
-      // after setup completed (or after another racer won).
       processExitReject = null;
-      processExitPromise.catch(() => {});
     }
     if (ACP_PERF_LOG) console.log(`[ACP-PERF] connect: protocol initialized ${Date.now() - initStart}ms`);
 
@@ -459,24 +514,15 @@ export class AcpConnection {
     return new Promise((resolve, reject) => {
       // Use longer timeout for session/prompt requests as they involve LLM processing
       // Complex tasks like document processing may need significantly more time
-      const timeoutDuration = method === 'session/prompt' ? 300000 : 60000; // 5 minutes for prompts, 1 minute for others
+      const timeoutDuration = method === 'session/prompt' ? this.promptTimeoutMs : 60000;
       const startTime = Date.now();
 
-      const createTimeoutHandler = () => {
-        return setTimeout(() => {
-          const request = this.pendingRequests.get(id);
-          if (request && !request.isPaused) {
-            this.pendingRequests.delete(id);
-            const timeoutMsg =
-              method === 'session/prompt'
-                ? `LLM request timed out after ${timeoutDuration / 1000} seconds`
-                : `Request ${method} timed out after ${timeoutDuration / 1000} seconds`;
-            reject(new Error(timeoutMsg));
-          }
-        }, timeoutDuration);
-      };
-
-      const initialTimeout = createTimeoutHandler();
+      const initialTimeout = setTimeout(() => {
+        const request = this.pendingRequests.get(id);
+        if (request && !request.isPaused) {
+          this.handlePromptTimeout(id, request);
+        }
+      }, timeoutDuration);
 
       const pendingRequest: PendingRequest<T> = {
         resolve: (value: T) => {
@@ -504,6 +550,24 @@ export class AcpConnection {
     });
   }
 
+  /**
+   * Handle request timeout: for session/prompt, send session/cancel to stop
+   * LLM generation without killing the process; for other methods, just reject.
+   */
+  private handlePromptTimeout(requestId: number, request: PendingRequest<unknown>): void {
+    this.pendingRequests.delete(requestId);
+    if (request.method === 'session/prompt') {
+      this.cancelPrompt();
+    }
+    request.reject(
+      new Error(
+        request.method === 'session/prompt'
+          ? `LLM request timed out after ${request.timeoutDuration / 1000} seconds`
+          : `Request ${request.method} timed out after ${request.timeoutDuration / 1000} seconds`
+      )
+    );
+  }
+
   // 暂停指定请求的超时计时器
   private pauseRequestTimeout(requestId: number): void {
     const request = this.pendingRequests.get(requestId);
@@ -515,25 +579,18 @@ export class AcpConnection {
   }
 
   // 恢复指定请求的超时计时器
+  // Reset startTime so the full timeout budget restarts after a permission pause.
+  // Without this, long permission waits cause immediate timeout on resume.
   private resumeRequestTimeout(requestId: number): void {
     const request = this.pendingRequests.get(requestId);
     if (request && request.isPaused) {
-      const elapsedTime = Date.now() - request.startTime;
-      const remainingTime = Math.max(0, request.timeoutDuration - elapsedTime);
-
-      if (remainingTime > 0) {
-        request.timeoutId = setTimeout(() => {
-          if (this.pendingRequests.has(requestId) && !request.isPaused) {
-            this.pendingRequests.delete(requestId);
-            request.reject(new Error(`Request ${request.method} timed out`));
-          }
-        }, remainingTime);
-        request.isPaused = false;
-      } else {
-        // 时间已超过，立即触发超时
-        this.pendingRequests.delete(requestId);
-        request.reject(new Error(`Request ${request.method} timed out`));
-      }
+      request.startTime = Date.now();
+      request.timeoutId = setTimeout(() => {
+        if (this.pendingRequests.has(requestId) && !request.isPaused) {
+          this.handlePromptTimeout(requestId, request);
+        }
+      }, request.timeoutDuration);
+      request.isPaused = false;
     }
   }
 
@@ -570,8 +627,7 @@ export class AcpConnection {
         request.startTime = Date.now();
         request.timeoutId = setTimeout(() => {
           if (this.pendingRequests.has(id) && !request.isPaused) {
-            this.pendingRequests.delete(id);
-            request.reject(new Error(`LLM request timed out after ${request.timeoutDuration / 1000} seconds`));
+            this.handlePromptTimeout(id, request);
           }
         }, request.timeoutDuration);
       }
@@ -823,19 +879,21 @@ export class AcpConnection {
    * @param sessionId - The session ID to load/resume
    * @param cwd - Working directory for the session
    */
-  async loadSession(sessionId: string, cwd: string = process.cwd()): Promise<AcpResponse & { sessionId?: string }> {
+  async loadSession(
+    sessionId: string,
+    cwd: string = process.cwd(),
+    mcpServers?: AcpSessionMcpServer[]
+  ): Promise<AcpResponse & { sessionId?: string }> {
     const normalizedCwd = this.normalizeCwdForAgent(cwd);
 
     const response = await this.sendRequest<AcpResponse & { sessionId?: string }>('session/load', {
       sessionId,
       cwd: normalizedCwd,
-      mcpServers: [] as unknown[],
+      mcpServers: (mcpServers ?? []) as unknown[],
     });
 
     // session/load returns modes/models/configOptions but not sessionId — keep the one we sent
     this.sessionId = response.sessionId || sessionId;
-
-    mainLog(`[ACP ${this.backend}]`, 'session/load completed', { sessionId: this.sessionId });
 
     this.parseSessionCapabilities(response);
 
@@ -855,17 +913,6 @@ export class AcpConnection {
     const modelsSource = result.models || (result._meta as Record<string, unknown> | undefined)?.models;
     if (modelsSource && typeof modelsSource === 'object') {
       this.models = modelsSource as AcpSessionModels;
-    }
-    if (this.backend === 'codex') {
-      const unifiedModelInfo = buildAcpModelInfo(this.configOptions, this.models);
-      const modelOption = this.configOptions?.find((opt) => opt.category === 'model');
-      mainLog('[ACP codex]', 'session capabilities parsed', {
-        rawCurrentModelId: this.models?.currentModelId || null,
-        rawAvailableModelCount: this.models?.availableModels?.length || 0,
-        configOptionModelCount:
-          modelOption && modelOption.type === 'select' && modelOption.options ? modelOption.options.length : 0,
-        unified: summarizeAcpModelInfo(unifiedModelInfo),
-      });
     }
   }
 
@@ -914,6 +961,33 @@ export class AcpConnection {
       sessionId: this.sessionId,
       prompt: [{ type: 'text', text: prompt }],
     });
+  }
+
+  /**
+   * Cancel the current prompt turn by sending a session/cancel notification.
+   * This tells the backend to stop LLM generation and tool calls ASAP.
+   * Also clears all pending session/prompt requests locally.
+   */
+  cancelPrompt(): void {
+    if (!this.sessionId) return;
+
+    // Send ACP session/cancel notification (no response expected)
+    this.sendMessage({
+      jsonrpc: JSONRPC_VERSION,
+      method: 'session/cancel',
+      params: { sessionId: this.sessionId },
+    });
+
+    // Clear all pending session/prompt requests
+    for (const [id, request] of this.pendingRequests) {
+      if (request.method === 'session/prompt') {
+        if (request.timeoutId) {
+          clearTimeout(request.timeoutId);
+        }
+        this.pendingRequests.delete(id);
+        request.resolve(null);
+      }
+    }
   }
 
   async setSessionMode(modeId: string): Promise<AcpResponse> {
@@ -990,6 +1064,21 @@ export class AcpConnection {
   }
 
   async disconnect(): Promise<void> {
+    // Try graceful session/close before killing the process.
+    // session/close is an ACP RFD (not yet required), so this is best-effort
+    // with a short timeout — if the agent supports it, it gets a chance to
+    // clean up its own child processes before we force-kill.
+    if (this.sessionId && this.child && !this.child.killed) {
+      try {
+        await Promise.race([
+          this.sendRequest('session/close', { sessionId: this.sessionId }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('session/close timeout')), 2000)),
+        ]);
+      } catch {
+        // Expected: most agents don't implement session/close yet
+      }
+    }
+
     await this.terminateChild();
 
     // Reset session-level state

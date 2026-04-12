@@ -14,8 +14,20 @@
  * 4. Shell environment is loaded and merged on macOS/Linux
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import path from 'path';
+
+const mocks = vi.hoisted(() => ({
+  isPackaged: vi.fn(() => false),
+}));
+
+vi.mock('@/common/platform', () => ({
+  getPlatformServices: () => ({
+    paths: {
+      isPackaged: () => mocks.isPackaged(),
+    },
+  }),
+}));
 
 // -------------------------------------------------------------------
 // 1. Pure-logic tests for mergePaths (no Electron, no mocking needed)
@@ -462,12 +474,405 @@ describe('resolveNpxPath', () => {
 
     const { resolveNpxPath } = await import('@process/utils/shellEnv');
 
-    expect(resolveNpxPath({ PATH: '/tooling' })).toBe('npx.cmd');
+    expect(resolveNpxPath({ PATH: '/tooling' })).toBe('npx');
+  });
+});
+
+describe('resolveNpxDirect', () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
+  it('returns null on non-Windows', async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+
+    vi.doMock('child_process', () => ({
+      execFileSync: vi.fn(),
+      execFile: vi.fn(),
+    }));
+
+    const { resolveNpxDirect } = await import('@process/utils/shellEnv');
+    expect(resolveNpxDirect({ PATH: '/usr/bin' })).toBeNull();
+  });
+
+  it('returns nodePath and npxScript on Windows when npm is present', async () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    const execFileSync = vi
+      .fn()
+      .mockReturnValueOnce(`${path.join('/tooling', 'node.exe')}\n`)
+      .mockReturnValueOnce('10.9.0\n');
+
+    vi.doMock('fs', async () => {
+      const actual = await vi.importActual<typeof import('fs')>('fs');
+      return {
+        ...actual,
+        existsSync: vi.fn(() => true),
+      };
+    });
+
+    vi.doMock('child_process', () => ({
+      execFileSync,
+      execFile: vi.fn(),
+    }));
+
+    const { resolveNpxDirect } = await import('@process/utils/shellEnv');
+    const result = resolveNpxDirect({ PATH: '/tooling' });
+    expect(result).toEqual({
+      nodePath: path.join('/tooling', 'node.exe'),
+      npxScript: path.join('/tooling', 'node_modules', 'npm', 'bin', 'npx-cli.js'),
+    });
+  });
+
+  it('returns null when npm scripts are missing on Windows', async () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    const execFileSync = vi.fn().mockReturnValueOnce(`${path.join('/tooling', 'node.exe')}\n`);
+
+    vi.doMock('fs', async () => {
+      const actual = await vi.importActual<typeof import('fs')>('fs');
+      return {
+        ...actual,
+        existsSync: vi.fn(() => false),
+      };
+    });
+
+    vi.doMock('child_process', () => ({
+      execFileSync,
+      execFile: vi.fn(),
+    }));
+
+    const { resolveNpxDirect } = await import('@process/utils/shellEnv');
+    expect(resolveNpxDirect({ PATH: '/tooling' })).toBeNull();
+  });
+
+  it('returns null when where command throws on Windows', async () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    const execFileSync = vi.fn().mockImplementation(() => {
+      throw new Error('where: command not found');
+    });
+
+    vi.doMock('child_process', () => ({
+      execFileSync,
+      execFile: vi.fn(),
+    }));
+
+    const { resolveNpxDirect } = await import('@process/utils/shellEnv');
+    expect(resolveNpxDirect({ PATH: '/tooling' })).toBeNull();
+  });
+
+  it('returns null when npx version is too old on Windows', async () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    const execFileSync = vi
+      .fn()
+      .mockReturnValueOnce(`${path.join('/tooling', 'node.exe')}\n`)
+      .mockReturnValueOnce('6.14.0\n');
+
+    vi.doMock('fs', async () => {
+      const actual = await vi.importActual<typeof import('fs')>('fs');
+      return {
+        ...actual,
+        existsSync: vi.fn(() => true),
+      };
+    });
+
+    vi.doMock('child_process', () => ({
+      execFileSync,
+      execFile: vi.fn(),
+    }));
+
+    const { resolveNpxDirect } = await import('@process/utils/shellEnv');
+    expect(resolveNpxDirect({ PATH: '/tooling' })).toBeNull();
   });
 });
 
 // -------------------------------------------------------------------
-// 5. Regression test: the fix that was applied to ForkTask.ts
+// 5. loadFullShellEnvironment — async, detached, with -i flag
+// -------------------------------------------------------------------
+describe('loadFullShellEnvironment', () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
+  it('returns empty object on Windows', async () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    vi.doMock('child_process', () => ({
+      execFileSync: vi.fn().mockImplementation(() => {
+        throw new Error('skip');
+      }),
+      execFile: vi.fn(),
+      spawn: vi.fn(),
+    }));
+
+    const { loadFullShellEnvironment } = await import('@process/utils/shellEnv');
+    const result = await loadFullShellEnvironment();
+    expect(result).toEqual({});
+  });
+
+  it('spawns shell with -i and -l flags in detached mode', async () => {
+    if (process.platform === 'win32') return;
+
+    const mockStdout = {
+      on: vi.fn((event: string, cb: (chunk: Buffer) => void) => {
+        if (event === 'data') {
+          cb(Buffer.from('SSS_API_KEY=secret123\nPATH=/usr/bin\nHOME=/home/user'));
+        }
+      }),
+    };
+    const mockStderr = { on: vi.fn() };
+    const mockChild = {
+      stdout: mockStdout,
+      stderr: mockStderr,
+      on: vi.fn((event: string, cb: (code: number) => void) => {
+        if (event === 'close') {
+          // Defer to allow stdout data to be processed
+          Promise.resolve().then(() => cb(0));
+        }
+      }),
+      unref: vi.fn(),
+      kill: vi.fn(),
+    };
+
+    const spawnMock = vi.fn().mockReturnValue(mockChild);
+
+    vi.doMock('child_process', () => ({
+      execFileSync: vi.fn().mockImplementation(() => {
+        throw new Error('skip');
+      }),
+      execFile: vi.fn(),
+      spawn: spawnMock,
+    }));
+
+    const { loadFullShellEnvironment } = await import('@process/utils/shellEnv');
+    const result = await loadFullShellEnvironment();
+
+    // Verify spawn was called with -i -l flags and detached: true
+    expect(spawnMock).toHaveBeenCalledWith(
+      expect.any(String),
+      ['-i', '-l', '-c', 'env'],
+      expect.objectContaining({ detached: true })
+    );
+
+    // Verify unref was called (detached child should not keep parent alive)
+    expect(mockChild.unref).toHaveBeenCalled();
+
+    // Verify env vars are parsed (no whitelist filtering)
+    expect(result.SSS_API_KEY).toBe('secret123');
+    expect(result.PATH).toBe('/usr/bin');
+    expect(result.HOME).toBe('/home/user');
+  });
+
+  it('returns cached result on second call', async () => {
+    if (process.platform === 'win32') return;
+
+    const mockStdout = {
+      on: vi.fn((event: string, cb: (chunk: Buffer) => void) => {
+        if (event === 'data') cb(Buffer.from('FOO=bar\n'));
+      }),
+    };
+    const mockStderr = { on: vi.fn() };
+    const mockChild = {
+      stdout: mockStdout,
+      stderr: mockStderr,
+      on: vi.fn((event: string, cb: (code: number) => void) => {
+        if (event === 'close') Promise.resolve().then(() => cb(0));
+      }),
+      unref: vi.fn(),
+      kill: vi.fn(),
+    };
+
+    const spawnMock = vi.fn().mockReturnValue(mockChild);
+
+    vi.doMock('child_process', () => ({
+      execFileSync: vi.fn().mockImplementation(() => {
+        throw new Error('skip');
+      }),
+      execFile: vi.fn(),
+      spawn: spawnMock,
+    }));
+
+    const { loadFullShellEnvironment } = await import('@process/utils/shellEnv');
+    const first = await loadFullShellEnvironment();
+    const second = await loadFullShellEnvironment();
+
+    expect(first).toBe(second);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses dscl-resolved shell on macOS (via resolveLoginShell)', async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+
+    const execFileSync = vi.fn().mockReturnValue('UserShell: /opt/homebrew/bin/fish\n');
+    const mockStdout = {
+      on: vi.fn((event: string, cb: (chunk: Buffer) => void) => {
+        if (event === 'data') cb(Buffer.from('PATH=/usr/bin\n'));
+      }),
+    };
+    const mockStderr = { on: vi.fn() };
+    const mockChild = {
+      stdout: mockStdout,
+      stderr: mockStderr,
+      on: vi.fn((event: string, cb: (code: number) => void) => {
+        if (event === 'close') Promise.resolve().then(() => cb(0));
+      }),
+      unref: vi.fn(),
+      kill: vi.fn(),
+    };
+    const spawnMock = vi.fn().mockReturnValue(mockChild);
+
+    vi.doMock('child_process', () => ({ execFileSync, execFile: vi.fn(), spawn: spawnMock }));
+    vi.doMock('os', () => {
+      const userInfo = vi.fn().mockReturnValue({ username: 'testuser' });
+      const homedir = vi.fn().mockReturnValue('/Users/testuser');
+      return { default: { userInfo, homedir }, userInfo, homedir };
+    });
+
+    const { loadFullShellEnvironment } = await import('@process/utils/shellEnv');
+    await loadFullShellEnvironment();
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      '/opt/homebrew/bin/fish',
+      ['-i', '-l', '-c', 'env'],
+      expect.objectContaining({ detached: true })
+    );
+  });
+
+  it('uses getent-resolved shell on Linux (via resolveLoginShell)', async () => {
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+
+    const execFileSync = vi.fn().mockReturnValue('testuser:x:1000:1000:Test User:/home/testuser:/usr/bin/zsh\n');
+    const mockStdout = {
+      on: vi.fn((event: string, cb: (chunk: Buffer) => void) => {
+        if (event === 'data') cb(Buffer.from('PATH=/usr/bin\n'));
+      }),
+    };
+    const mockStderr = { on: vi.fn() };
+    const mockChild = {
+      stdout: mockStdout,
+      stderr: mockStderr,
+      on: vi.fn((event: string, cb: (code: number) => void) => {
+        if (event === 'close') Promise.resolve().then(() => cb(0));
+      }),
+      unref: vi.fn(),
+      kill: vi.fn(),
+    };
+    const spawnMock = vi.fn().mockReturnValue(mockChild);
+
+    vi.doMock('child_process', () => ({ execFileSync, execFile: vi.fn(), spawn: spawnMock }));
+    vi.doMock('os', () => {
+      const userInfo = vi.fn().mockReturnValue({ username: 'testuser' });
+      const homedir = vi.fn().mockReturnValue('/home/testuser');
+      return { default: { userInfo, homedir }, userInfo, homedir };
+    });
+
+    const { loadFullShellEnvironment } = await import('@process/utils/shellEnv');
+    await loadFullShellEnvironment();
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      '/usr/bin/zsh',
+      ['-i', '-l', '-c', 'env'],
+      expect.objectContaining({ detached: true })
+    );
+  });
+
+  it('falls back to /bin/zsh on macOS when dscl fails', async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+
+    const execFileSync = vi.fn().mockImplementation(() => {
+      throw new Error('dscl failed');
+    });
+    const mockStdout = {
+      on: vi.fn((event: string, cb: (chunk: Buffer) => void) => {
+        if (event === 'data') cb(Buffer.from('PATH=/usr/bin\n'));
+      }),
+    };
+    const mockStderr = { on: vi.fn() };
+    const mockChild = {
+      stdout: mockStdout,
+      stderr: mockStderr,
+      on: vi.fn((event: string, cb: (code: number) => void) => {
+        if (event === 'close') Promise.resolve().then(() => cb(0));
+      }),
+      unref: vi.fn(),
+      kill: vi.fn(),
+    };
+    const spawnMock = vi.fn().mockReturnValue(mockChild);
+
+    vi.doMock('child_process', () => ({ execFileSync, execFile: vi.fn(), spawn: spawnMock }));
+    vi.doMock('os', () => {
+      const userInfo = vi.fn().mockReturnValue({ username: 'testuser' });
+      const homedir = vi.fn().mockReturnValue('/Users/testuser');
+      return { default: { userInfo, homedir }, userInfo, homedir };
+    });
+
+    const { loadFullShellEnvironment } = await import('@process/utils/shellEnv');
+    await loadFullShellEnvironment();
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      '/bin/zsh',
+      ['-i', '-l', '-c', 'env'],
+      expect.objectContaining({ detached: true })
+    );
+  });
+
+  it('falls back to /bin/bash on Linux when getent fails', async () => {
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+
+    const execFileSync = vi.fn().mockImplementation(() => {
+      throw new Error('getent failed');
+    });
+    const mockStdout = {
+      on: vi.fn((event: string, cb: (chunk: Buffer) => void) => {
+        if (event === 'data') cb(Buffer.from('PATH=/usr/bin\n'));
+      }),
+    };
+    const mockStderr = { on: vi.fn() };
+    const mockChild = {
+      stdout: mockStdout,
+      stderr: mockStderr,
+      on: vi.fn((event: string, cb: (code: number) => void) => {
+        if (event === 'close') Promise.resolve().then(() => cb(0));
+      }),
+      unref: vi.fn(),
+      kill: vi.fn(),
+    };
+    const spawnMock = vi.fn().mockReturnValue(mockChild);
+
+    vi.doMock('child_process', () => ({ execFileSync, execFile: vi.fn(), spawn: spawnMock }));
+    vi.doMock('os', () => {
+      const userInfo = vi.fn().mockReturnValue({ username: 'testuser' });
+      const homedir = vi.fn().mockReturnValue('/home/testuser');
+      return { default: { userInfo, homedir }, userInfo, homedir };
+    });
+
+    const { loadFullShellEnvironment } = await import('@process/utils/shellEnv');
+    await loadFullShellEnvironment();
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      '/bin/bash',
+      ['-i', '-l', '-c', 'env'],
+      expect.objectContaining({ detached: true })
+    );
+  });
+});
+
+// -------------------------------------------------------------------
+// 6. Regression test: the fix that was applied to ForkTask.ts
 //    Documents the expected behavior: getEnhancedEnv must be called
 //    so workers get the full PATH.
 // -------------------------------------------------------------------

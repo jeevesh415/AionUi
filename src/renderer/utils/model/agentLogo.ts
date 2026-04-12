@@ -10,6 +10,7 @@
  * All places that need to display agent icons should use this utility instead of maintaining separate lists
  */
 
+import AionLogo from '@/renderer/assets/logos/brand/aion.svg';
 import AuggieLogo from '@/renderer/assets/logos/brand/auggie.svg';
 import ClaudeLogo from '@/renderer/assets/logos/ai-major/claude.svg';
 import CursorLogo from '@/renderer/assets/logos/tools/coding/cursor.png';
@@ -19,6 +20,7 @@ import DroidLogo from '@/renderer/assets/logos/brand/droid.svg';
 import GeminiLogo from '@/renderer/assets/logos/ai-major/gemini.svg';
 import GitHubLogo from '@/renderer/assets/logos/tools/github.svg';
 import GooseLogo from '@/renderer/assets/logos/tools/goose.svg';
+import HermesLogo from '@/renderer/assets/logos/brand/hermes.svg';
 import IflowLogo from '@/renderer/assets/logos/tools/iflow.svg';
 import KimiLogo from '@/renderer/assets/logos/ai-china/kimi.svg';
 import MistralLogo from '@/renderer/assets/logos/ai-major/mistral.svg';
@@ -37,6 +39,7 @@ import QwenLogo from '@/renderer/assets/logos/ai-china/qwen.svg';
  * Note: keys are lowercase, supports multiple variants (e.g., openclaw-gateway and openclaw)
  */
 const AGENT_LOGO_MAP = {
+  aionrs: AionLogo,
   claude: ClaudeLogo,
   gemini: GeminiLogo,
   qwen: QwenLogo,
@@ -45,6 +48,7 @@ const AGENT_LOGO_MAP = {
   codebuddy: CodeBuddyLogo,
   droid: DroidLogo,
   goose: GooseLogo,
+  hermes: HermesLogo,
   auggie: AuggieLogo,
   kimi: KimiLogo,
   opencode: OpenCodeLogoLight,
@@ -53,6 +57,7 @@ const AGENT_LOGO_MAP = {
   'openclaw-gateway': OpenClawLogo,
   vibe: MistralLogo,
   nanobot: NanobotLogo,
+  remote: OpenClawLogo,
   qoder: QoderLogo,
   cursor: CursorLogo,
 } as const satisfies Record<string, string>;
@@ -82,6 +87,33 @@ export function getAgentLogo(agent: string | undefined | null): string | null {
     return isDarkTheme() ? OpenCodeLogoDark : OpenCodeLogoLight;
   }
   return AGENT_LOGO_MAP[key] || null;
+}
+
+/**
+ * Resolve the best available logo for an agent.
+ *
+ * Priority:
+ *   1. Explicit icon/avatar (if provided)
+ *   2. Adapter ID from customAgentId (format `ext:extensionName:adapterId`) → built-in logo map
+ *   3. Backend ID → built-in logo map
+ *   4. null (caller renders its own fallback)
+ */
+export function resolveAgentLogo(opts: {
+  icon?: string | null;
+  backend?: string | null;
+  customAgentId?: string | null;
+  isExtension?: boolean;
+}): string | null {
+  if (opts.icon) return opts.icon;
+
+  // For extension agents, extract adapter ID from customAgentId
+  if (opts.isExtension && opts.customAgentId) {
+    const adapterId = opts.customAgentId.split(':').pop();
+    const logo = getAgentLogo(adapterId);
+    if (logo) return logo;
+  }
+
+  return getAgentLogo(opts.backend);
 }
 
 /**

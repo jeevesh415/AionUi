@@ -5,6 +5,7 @@
  */
 
 import type { AcpBackend, AcpBackendAll, AcpBackendConfig } from '@/common/types/acpTypes';
+import type { SpeechToTextConfig } from '@/common/types/speech';
 import { storage } from '@office-ai/platform';
 
 /**
@@ -33,10 +34,13 @@ export interface IConfigStorageRefer {
     yoloMode?: boolean;
     /** Preferred session mode for new conversations / 新会话的默认模式 */
     preferredMode?: string;
+    /** Preferred model ID for new conversations / 新会话的默认模型 */
+    preferredModelId?: string;
   };
   'codex.config'?: {
     cliPath?: string;
     yoloMode?: boolean;
+    sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
   };
   'acp.config': {
     [backend in AcpBackend]?: {
@@ -49,17 +53,27 @@ export interface IConfigStorageRefer {
       preferredMode?: string;
       /** Preferred model ID for new conversations / 新会话的默认模型 */
       preferredModelId?: string;
+      /** LLM prompt timeout in seconds (default: 300) / LLM 请求超时时间（秒，默认 300） */
+      promptTimeout?: number;
     };
   };
+  /** Global LLM prompt timeout in seconds (default: 300). Per-backend promptTimeout overrides this. */
+  'acp.promptTimeout'?: number;
+  /** Idle timeout in minutes before an ACP agent process is killed to reclaim memory (default: 5). */
+  'acp.agentIdleTimeout'?: number;
   'acp.customAgents'?: AcpBackendConfig[];
   // Cached model lists per ACP backend for Guid page pre-selection
   'acp.cachedModels'?: Record<string, import('@/common/types/acpTypes').AcpModelInfo>;
+  // Cached config options per ACP backend for Guid page pre-selection
+  'acp.cachedConfigOptions'?: Record<string, import('@/common/types/acpTypes').AcpSessionConfigOption[]>;
   'model.config': IProvider[];
   'mcp.config': IMcpServer[];
   'mcp.agentInstallStatus': Record<string, string[]>;
   language: string;
   theme: string;
   colorScheme: string;
+  /** Persisted app-wide UI zoom factor for Display settings */
+  'ui.zoomFactor'?: number;
   /** 桌面模式下是否自动启用 WebUI / Auto-enable WebUI in desktop mode */
   'webui.desktop.enabled'?: boolean;
   /** 桌面模式下是否允许远程访问 / Allow remote access in desktop mode */
@@ -74,8 +88,11 @@ export interface IConfigStorageRefer {
     /** @deprecated Image generation is now controlled via built-in MCP server toggle */
     switch?: boolean;
   };
+  'tools.speechToText'?: SpeechToTextConfig;
   // 是否在粘贴文件到工作区时询问确认（true = 不再询问）
   'workspace.pasteConfirm'?: boolean;
+  // 上传的文件是否保存到工作区目录（true = 保存到工作区，false = 保存到缓存目录）
+  'upload.saveToWorkspace'?: boolean;
   // guid 页面上次选择的 agent 类型 / Last selected agent type on guid page
   'guid.lastSelectedAgent'?: string;
   // 迁移标记：修复老版本中助手 enabled 默认值问题 / Migration flag: fix assistant enabled default value issue
@@ -95,6 +112,12 @@ export interface IConfigStorageRefer {
   'system.notificationEnabled'?: boolean;
   // 定时任务完成时显示系统通知 / Show system notification when scheduled task completes
   'system.cronNotificationEnabled'?: boolean;
+  // 阻止系统休眠以保证定时任务执行 / Prevent system sleep to ensure scheduled tasks run
+  'system.keepAwake'?: boolean;
+  // Whether conversation command queue is enabled
+  'system.commandQueueEnabled'?: boolean;
+  // Automatically preview newly created Office files in the current workspace
+  'system.autoPreviewOfficeFiles'?: boolean;
   // Telegram assistant default model / Telegram 助手默认模型
   'assistant.telegram.defaultModel'?: {
     id: string;
@@ -128,8 +151,28 @@ export interface IConfigStorageRefer {
     customAgentId?: string;
     name?: string;
   };
+  // WeChat assistant default model / WeChat 助手默认模型
+  'assistant.weixin.defaultModel'?: {
+    id: string;
+    useModel: string;
+  };
+  // WeChat assistant agent selection / WeChat 助手所使用的 Agent
+  'assistant.weixin.agent'?: {
+    backend: AcpBackendAll;
+    customAgentId?: string;
+    name?: string;
+  };
   // Skills Market: whether the aionui-skills builtin skill is enabled
   'skillsMarket.enabled'?: boolean;
+  // Desktop Pet: whether the desktop pet feature is enabled
+  'pet.enabled'?: boolean;
+  // Desktop Pet: size in pixels (200, 280, or 360)
+  'pet.size'?: number;
+  // Desktop Pet: do not disturb mode (pet stays idle, ignores AI events)
+  'pet.dnd'?: boolean;
+  // Desktop Pet: whether tool-call confirmations are routed to the pet's bubble
+  // (true) or remain in the main chat window (false). Default true.
+  'pet.confirmEnabled'?: boolean;
 }
 
 export interface IEnvStorageRefer {
@@ -143,7 +186,7 @@ export interface IEnvStorageRefer {
  * Conversation source type - identifies where the conversation was created
  * 会话来源类型 - 标识会话创建的来源
  */
-export type ConversationSource = 'aionui' | 'telegram' | 'lark' | 'dingtalk' | (string & {});
+export type ConversationSource = 'aionui' | 'telegram' | 'lark' | 'dingtalk' | 'weixin' | (string & {});
 
 interface IChatConversation<T, Extra> {
   createTime: number;
@@ -190,6 +233,8 @@ export type TChatConversation =
         sessionMode?: string;
         /** Explicit marker for temporary health-check conversations */
         isHealthCheck?: boolean;
+        /** Cron job ID that spawned this conversation */
+        cronJobId?: string;
       }
     >
   | Omit<
@@ -213,6 +258,8 @@ export type TChatConversation =
           pinnedAt?: number;
           /** ACP 后端的 session UUID，用于会话恢复 / ACP backend session UUID for session resume */
           acpSessionId?: string;
+          /** Conversation ID that owns the ACP session / 拥有该 ACP session 的会话 ID */
+          acpSessionConversationId?: string;
           /** ACP session 最后更新时间 / Last update time of ACP session */
           acpSessionUpdatedAt?: number;
           /** Last context usage from usage_update */
@@ -223,8 +270,14 @@ export type TChatConversation =
           sessionMode?: string;
           /** Persisted model ID for resume support / 持久化的模型 ID，用于恢复 */
           currentModelId?: string;
+          /** Cached config options from ACP backend / 缓存的 ACP 配置选项 */
+          cachedConfigOptions?: import('@/common/types/acpTypes').AcpSessionConfigOption[];
+          /** Pending config option selections from Guid page / Guid 页面待应用的配置选项 */
+          pendingConfigOptions?: Record<string, string>;
           /** Explicit marker for temporary health-check conversations */
           isHealthCheck?: boolean;
+          /** Cron job ID that spawned this conversation */
+          cronJobId?: string;
         }
       >,
       'model'
@@ -252,6 +305,8 @@ export type TChatConversation =
           codexModel?: string;
           /** Explicit marker for temporary health-check conversations */
           isHealthCheck?: boolean;
+          /** Cron job ID that spawned this conversation */
+          cronJobId?: string;
         }
       >,
       'model'
@@ -295,6 +350,8 @@ export type TChatConversation =
           pinnedAt?: number;
           /** Explicit marker for temporary health-check conversations */
           isHealthCheck?: boolean;
+          /** Cron job ID that spawned this conversation */
+          cronJobId?: string;
         }
       >,
       'model'
@@ -315,9 +372,67 @@ export type TChatConversation =
           pinnedAt?: number;
           /** Explicit marker for temporary health-check conversations */
           isHealthCheck?: boolean;
+          /** Cron job ID that spawned this conversation */
+          cronJobId?: string;
         }
       >,
       'model'
+    >
+  | Omit<
+      IChatConversation<
+        'remote',
+        {
+          workspace?: string;
+          customWorkspace?: boolean;
+          /** Remote agent config ID (FK to remote_agents table) */
+          remoteAgentId: string;
+          /** Remote session key for resume */
+          sessionKey?: string;
+          /** Enabled skills list */
+          enabledSkills?: string[];
+          /** Preset assistant ID */
+          presetAssistantId?: string;
+          /** Whether this conversation is pinned */
+          pinned?: boolean;
+          /** Pin timestamp in milliseconds */
+          pinnedAt?: number;
+          /** Explicit marker for temporary health-check conversations */
+          isHealthCheck?: boolean;
+          /** Cron job ID that spawned this conversation */
+          cronJobId?: string;
+        }
+      >,
+      'model'
+    >
+  | IChatConversation<
+      'aionrs',
+      {
+        workspace: string;
+        customWorkspace?: boolean;
+        proxy?: string;
+        /** System rules injected at initialization */
+        presetRules?: string;
+        /** Enabled skills list */
+        enabledSkills?: string[];
+        /** Preset assistant ID */
+        presetAssistantId?: string;
+        /** Whether this conversation is pinned */
+        pinned?: boolean;
+        /** Pin timestamp in milliseconds */
+        pinnedAt?: number;
+        /** Max tokens per response */
+        maxTokens?: number;
+        /** Max agentic turns */
+        maxTurns?: number;
+        /** Persisted session mode for resume support */
+        sessionMode?: string;
+        /** Explicit marker for temporary health-check conversations */
+        isHealthCheck?: boolean;
+        /** Last token usage stats */
+        lastTokenUsage?: TokenUsageData;
+        /** Cron job ID that spawned this conversation */
+        cronJobId?: string;
+      }
     >;
 
 export type IChatConversationRefer = {
@@ -404,7 +519,9 @@ export interface IProvider {
   >;
 }
 
-export type TProviderWithModel = Omit<IProvider, 'model'> & { useModel: string };
+export type TProviderWithModel = Omit<IProvider, 'model'> & {
+  useModel: string;
+};
 
 // MCP Server Configuration Types
 export type McpTransportType = 'stdio' | 'sse' | 'http';
@@ -463,6 +580,7 @@ export interface IMcpTool {
   name: string;
   description?: string;
   inputSchema?: unknown;
+  _meta?: Record<string, unknown>;
 }
 
 /**

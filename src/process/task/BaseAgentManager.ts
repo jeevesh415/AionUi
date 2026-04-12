@@ -26,6 +26,10 @@ class BaseAgentManager<Data, ConfirmationOption extends any = any>
   conversation_id: string = '';
   protected confirmations: Array<IConfirmation<ConfirmationOption>> = [];
   status: AgentStatus | undefined;
+  protected _lastActivityAt: number = Date.now();
+  get lastActivityAt(): number {
+    return this._lastActivityAt;
+  }
 
   /**
    * Whether this agent is in yolo mode (auto-approve)
@@ -34,11 +38,15 @@ class BaseAgentManager<Data, ConfirmationOption extends any = any>
 
   protected readonly emitter: IAgentEventEmitter;
 
-  constructor(type: AgentType, data: Data, emitter: IAgentEventEmitter) {
-    super(path.resolve(__dirname, type + '.js'), {
-      type: type,
-      data: data,
-    });
+  constructor(type: AgentType, data: Data, emitter: IAgentEventEmitter, enableFork = true) {
+    super(
+      path.resolve(__dirname, type + '.js'),
+      {
+        type: type,
+        data: data,
+      },
+      enableFork
+    );
     this.type = type;
     this.emitter = emitter;
 
@@ -102,10 +110,12 @@ class BaseAgentManager<Data, ConfirmationOption extends any = any>
   }
 
   stop() {
+    this.confirmations = [];
     return this.postMessagePromise('stop.stream', {});
   }
 
   sendMessage(data: any) {
+    this._lastActivityAt = Date.now();
     return this.postMessagePromise('send.message', data);
   }
 

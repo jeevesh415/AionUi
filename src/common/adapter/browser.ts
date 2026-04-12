@@ -95,12 +95,18 @@ if (win.electronAPI) {
       return;
     }
 
-    socket.addEventListener('open', () => {
+    // Capture the socket created in this call so the close handler only
+    // nulls the outer reference when it still points at THIS socket.
+    // Without this guard, a late-firing close event from the OLD socket
+    // could wipe the reference to a NEWLY created replacement socket.
+    const currentSocket = socket;
+
+    currentSocket.addEventListener('open', () => {
       reconnectDelay = 500;
       flushQueue();
     });
 
-    socket.addEventListener('message', (event: MessageEvent) => {
+    currentSocket.addEventListener('message', (event: MessageEvent) => {
       if (!emitterRef) {
         return;
       }
@@ -145,8 +151,10 @@ if (win.electronAPI) {
 
           // 短暂延迟后跳转到登录页，以便显示 UI 反馈
           // Redirect to login page after a short delay to show any UI feedback
+          // Use hash navigation to stay within the SPA (HashRouter), avoiding a full
+          // page reload that would land on an empty hash and cause a blank screen.
           setTimeout(() => {
-            window.location.href = '/login';
+            window.location.hash = '/login';
           }, 1000);
 
           return;
@@ -158,8 +166,11 @@ if (win.electronAPI) {
       }
     });
 
-    socket.addEventListener('close', (event: CloseEvent) => {
-      socket = null;
+    currentSocket.addEventListener('close', (event: CloseEvent) => {
+      // Only null the outer reference if it still points at this socket.
+      if (socket === currentSocket) {
+        socket = null;
+      }
 
       // Detect auth failure from close code (server sends 1008 for token issues).
       // This acts as a fallback in case the auth-expired message was not received
@@ -179,8 +190,9 @@ if (win.electronAPI) {
         if (window.location.pathname === '/login' || window.location.hash.includes('/login')) {
           return;
         }
+        // Use hash navigation to stay within the SPA (HashRouter)
         setTimeout(() => {
-          window.location.href = '/login';
+          window.location.hash = '/login';
         }, 500);
         return;
       }
@@ -188,8 +200,8 @@ if (win.electronAPI) {
       scheduleReconnect();
     });
 
-    socket.addEventListener('error', () => {
-      socket?.close();
+    currentSocket.addEventListener('error', () => {
+      currentSocket.close();
     });
   };
 

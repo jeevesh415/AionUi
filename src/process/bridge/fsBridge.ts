@@ -6,6 +6,7 @@
 
 import { AIONUI_TIMESTAMP_SEPARATOR } from '@/common/config/constants';
 import fs from 'fs/promises';
+import type { Dirent } from 'fs';
 import path from 'path';
 import os from 'os';
 import https from 'node:https';
@@ -14,6 +15,7 @@ import JSZip from 'jszip';
 import { ipcBridge } from '@/common';
 import { getSystemDir, getAssistantsDir, getSkillsDir, getBuiltinSkillsCopyDir } from '@process/utils/initStorage';
 import { readDirectoryRecursive } from '@process/utils';
+import type { IWorkspaceFlatFile } from '@/common/adapter/ipcBridge';
 
 // ============================================================================
 // Helper functions for builtin resource directory resolution
@@ -169,6 +171,129 @@ async function deleteAssistantResource(resourceType: ResourceType, filePattern: 
 const ruleFilePattern = (id: string, loc: string) => `${id}.${loc}.md`;
 const skillFilePattern = (id: string, loc: string) => `${id}-skills.${loc}.md`;
 
+const workspaceFileListCache = new Map<string, IWorkspaceFlatFile[]>();
+const workspaceFileListInFlight = new Map<string, Promise<IWorkspaceFlatFile[]>>();
+const workspaceFileListGeneration = new Map<string, number>();
+
+function isPathWithinRoot(root: string, targetPath: string): boolean {
+  const relativePath = path.relative(root, targetPath);
+  return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+function normalizeWorkspaceRelativePath(root: string, fullPath: string): string {
+  return path.relative(root, fullPath).split(path.sep).join('/');
+}
+
+function invalidateWorkspaceFileListCacheByPath(changedPath: string): void {
+  const normalizedPath = path.resolve(changedPath);
+  const roots = new Set([...workspaceFileListCache.keys(), ...workspaceFileListInFlight.keys()]);
+
+  for (const root of roots) {
+    if (!isPathWithinRoot(root, normalizedPath)) {
+      continue;
+    }
+
+    workspaceFileListCache.delete(root);
+    workspaceFileListInFlight.delete(root);
+    workspaceFileListGeneration.set(root, (workspaceFileListGeneration.get(root) ?? 0) + 1);
+  }
+}
+
+const MAX_WORKSPACE_FILES = 20_000;
+
+async function listWorkspaceFilesRecursive(root: string): Promise<IWorkspaceFlatFile[]> {
+  const normalizedRoot = path.resolve(root);
+  const entries: IWorkspaceFlatFile[] = [];
+
+  const walk = async (currentDir: string): Promise<void> => {
+    if (entries.length >= MAX_WORKSPACE_FILES) {
+      return;
+    }
+
+    let dirEntries: Dirent[];
+    try {
+      dirEntries = await fs.readdir(currentDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of dirEntries) {
+      if (entries.length >= MAX_WORKSPACE_FILES) {
+        break;
+      }
+
+      if (entry.name === 'node_modules') {
+        continue;
+      }
+
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+        continue;
+      }
+
+      if (!entry.isFile()) {
+        // Intentionally skip symlinks to avoid circular reference risks
+        continue;
+      }
+
+      entries.push({
+        name: entry.name,
+        fullPath,
+        relativePath: normalizeWorkspaceRelativePath(normalizedRoot, fullPath),
+      });
+    }
+  };
+
+  await walk(normalizedRoot);
+  entries.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  return entries;
+}
+
+async function getCachedWorkspaceFiles(root: string): Promise<IWorkspaceFlatFile[]> {
+  const normalizedRoot = path.resolve(root);
+
+  try {
+    const stats = await fs.stat(normalizedRoot);
+    if (!stats.isDirectory()) {
+      workspaceFileListCache.delete(normalizedRoot);
+      workspaceFileListInFlight.delete(normalizedRoot);
+      return [];
+    }
+  } catch {
+    workspaceFileListCache.delete(normalizedRoot);
+    workspaceFileListInFlight.delete(normalizedRoot);
+    return [];
+  }
+
+  const cached = workspaceFileListCache.get(normalizedRoot);
+  if (cached) {
+    return cached;
+  }
+
+  const inFlight = workspaceFileListInFlight.get(normalizedRoot);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const requestGeneration = workspaceFileListGeneration.get(normalizedRoot) ?? 0;
+  const request = listWorkspaceFilesRecursive(normalizedRoot)
+    .then((files) => {
+      if ((workspaceFileListGeneration.get(normalizedRoot) ?? 0) === requestGeneration) {
+        workspaceFileListCache.set(normalizedRoot, files);
+      }
+      return files;
+    })
+    .finally(() => {
+      if (workspaceFileListInFlight.get(normalizedRoot) === request) {
+        workspaceFileListInFlight.delete(normalizedRoot);
+      }
+    });
+
+  workspaceFileListInFlight.set(normalizedRoot, request);
+  return request;
+}
+
 export function initFsBridge(): void {
   const canceledZipRequests = new Set<string>();
 
@@ -178,6 +303,15 @@ export function initFsBridge(): void {
       return tree ? [tree] : [];
     } catch (error) {
       console.error('[fsBridge] Failed to read directory:', dir, error);
+      return [];
+    }
+  });
+
+  ipcBridge.fs.listWorkspaceFiles.provider(async ({ root }) => {
+    try {
+      return await getCachedWorkspaceFiles(root);
+    } catch (error) {
+      console.error('[fsBridge] Failed to list workspace files:', root, error);
       return [];
     }
   });
@@ -213,7 +347,12 @@ export function initFsBridge(): void {
     redirectCount = 0
   ): Promise<{ buffer: Buffer; contentType?: string }> => {
     const allowedProtocols = new Set(['http:', 'https:']);
-    const parsedUrl = new URL(targetUrl);
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(targetUrl);
+    } catch {
+      return Promise.reject(new Error(`Invalid URL: ${targetUrl}`));
+    }
     if (!allowedProtocols.has(parsedUrl.protocol)) {
       return Promise.reject(new Error('Unsupported protocol'));
     }
@@ -242,7 +381,13 @@ export function initFsBridge(): void {
             const { statusCode = 0, headers } = response;
 
             if (statusCode >= 300 && statusCode < 400 && headers.location && redirectCount < 5) {
-              const redirectUrl = new URL(headers.location, targetUrl).toString();
+              let redirectUrl: string;
+              try {
+                redirectUrl = new URL(headers.location, targetUrl).toString();
+              } catch {
+                reject(new Error(`Invalid redirect URL: ${headers.location}`));
+                return;
+              }
               response.resume();
               resolve(downloadRemoteBuffer(redirectUrl, redirectCount + 1));
               return;
@@ -338,13 +483,22 @@ export function initFsBridge(): void {
   });
 
   // 读取文件内容（UTF-8编码）/ Read file content (UTF-8 encoding)
+  // V8 string length limit is ~512MB; guard against RangeError on oversized files
+  const MAX_READ_FILE_SIZE = 256 * 1024 * 1024; // 256 MB
+
   ipcBridge.fs.readFile.provider(async ({ path: filePath }) => {
     try {
+      const stat = await fs.stat(filePath);
+      if (stat.size > MAX_READ_FILE_SIZE) {
+        console.warn(`[fsBridge] File too large to read as text (${stat.size} bytes): ${filePath}`);
+        return null;
+      }
       const content = await fs.readFile(filePath, 'utf-8');
       return content;
     } catch (error) {
-      // Return null for missing files (e.g., cleaned-up temp workspaces)
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      const code = (error as NodeJS.ErrnoException).code;
+      // Return null for missing or locked files (e.g., cleaned-up temp workspaces, Windows file locks)
+      if (code === 'ENOENT' || code === 'EBUSY') {
         return null;
       }
       console.error('Failed to read file:', error);
@@ -360,7 +514,8 @@ export function initFsBridge(): void {
       // Convert Node.js Buffer to ArrayBuffer
       return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'EBUSY') {
         return null;
       }
       console.error('Failed to read file buffer:', error);
@@ -395,6 +550,7 @@ export function initFsBridge(): void {
           console.error('[fsBridge] ❌ Failed to emit file stream update:', emitError);
         }
 
+        invalidateWorkspaceFileListCacheByPath(filePath);
         return true;
       }
 
@@ -423,6 +579,7 @@ export function initFsBridge(): void {
       }
 
       await fs.writeFile(filePath, bufferData);
+      invalidateWorkspaceFileListCacheByPath(filePath);
       return true;
     } catch (error) {
       console.error('Failed to write file:', error);
@@ -639,6 +796,9 @@ export function initFsBridge(): void {
       // 只要存在失败文件就视作部分失败，并返回提示信息 / Mark operation as non-success if anything failed and provide hint text
       const success = failedFiles.length === 0;
       const msg = success ? undefined : 'Some files failed to copy';
+      if (copiedFiles.length > 0) {
+        invalidateWorkspaceFileListCacheByPath(workspace);
+      }
 
       return {
         success,
@@ -660,6 +820,7 @@ export function initFsBridge(): void {
       const stats = await fs.lstat(targetPath);
       if (stats.isDirectory()) {
         await fs.rm(targetPath, { recursive: true, force: true });
+        invalidateWorkspaceFileListCacheByPath(targetPath);
       } else {
         await fs.unlink(targetPath);
 
@@ -680,6 +841,8 @@ export function initFsBridge(): void {
         } catch (emitError) {
           console.error('[fsBridge] Failed to emit file stream delete:', emitError);
         }
+
+        invalidateWorkspaceFileListCacheByPath(targetPath);
       }
       return { success: true };
     } catch (error) {
@@ -713,6 +876,8 @@ export function initFsBridge(): void {
       }
 
       await fs.rename(targetPath, newPath);
+      invalidateWorkspaceFileListCacheByPath(targetPath);
+      invalidateWorkspaceFileListCacheByPath(newPath);
       return { success: true, data: { newPath } };
     } catch (error) {
       console.error('Failed to rename entry:', error);

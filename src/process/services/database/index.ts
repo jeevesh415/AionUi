@@ -34,8 +34,14 @@ import type {
   PluginStatus,
 } from '@process/channels/types';
 import type { ConversationSource, TProviderWithModel } from '@/common/config/storage';
+import type { RemoteAgentConfig, RemoteAgentStatus } from '@process/agent/remote';
 import { rowToChannelUser, rowToChannelSession, rowToPairingRequest } from '@process/channels/types';
-import { encryptCredentials, decryptCredentials } from '@process/channels/utils/credentialCrypto';
+import {
+  encryptCredentials,
+  decryptCredentials,
+  encryptString,
+  decryptString,
+} from '@process/channels/utils/credentialCrypto';
 
 type IConversationMessageSearchRow = IConversationRow & {
   message_id: string;
@@ -99,12 +105,36 @@ export class AionUIDatabase {
     ensureDirectory(dir);
 
     // Attempt normal initialization
+    let failedDriver: ISqliteDriver | null = null;
     try {
       const driver = await createDriver(dbPath);
+      failedDriver = driver;
       const instance = new AionUIDatabase(driver);
       instance.initialize();
       return instance;
     } catch (error) {
+      // Close the driver opened during the failed attempt.
+      // On Windows, leaving it open locks the file and prevents recovery (EPERM).
+      if (failedDriver) {
+        try {
+          failedDriver.close();
+        } catch {
+          // ignore close errors during recovery
+        }
+        failedDriver = null;
+      }
+
+      // Distinguish driver-level errors (native module mismatch, missing .node file)
+      // from actual database corruption. Driver errors must NOT trigger recovery —
+      // replacing a healthy database because of a build tooling issue causes data loss.
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes('NODE_MODULE_VERSION') || msg.includes('was compiled against') || msg.includes('dlopen')) {
+        console.error(
+          '[Database] Native module load error — will NOT attempt recovery (database is likely intact):',
+          msg
+        );
+        throw error;
+      }
       console.error('[Database] Failed to initialize, attempting recovery...', error);
     }
 
@@ -213,6 +243,14 @@ export class AionUIDatabase {
       };
     }
   }
+  /**
+   * Expose the underlying SQLite driver for repositories that need raw SQL access.
+   * Prefer using dedicated methods on AionUIDatabase where possible.
+   */
+  getDriver(): ISqliteDriver {
+    return this.db;
+  }
+
   /**
    * Close database connection
    */
@@ -594,7 +632,7 @@ export class AionUIDatabase {
    * Used when channel settings change to propagate new model to existing conversations.
    */
   updateChannelConversationModel(
-    source: 'telegram' | 'lark' | 'dingtalk',
+    source: 'telegram' | 'lark' | 'dingtalk' | 'weixin',
     type: string,
     model: TProviderWithModel,
     userId?: string
@@ -636,8 +674,17 @@ export class AionUIDatabase {
         )
         .all(finalUserId, pageSize, page * pageSize) as IConversationRow[];
 
+      const data: TChatConversation[] = [];
+      for (const row of rows) {
+        try {
+          data.push(rowToConversation(row));
+        } catch (e) {
+          console.warn('[Database] Skipping conversation row with unknown type:', row.type, row.id);
+        }
+      }
+
       return {
-        data: rows.map(rowToConversation),
+        data,
         total: countResult.count,
         page,
         pageSize,
@@ -653,6 +700,21 @@ export class AionUIDatabase {
         hasMore: false,
       };
     }
+  }
+
+  getConversationsByCronJobId(cronJobId: string): TChatConversation[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM conversations WHERE json_extract(extra, '$.cronJobId') = ? ORDER BY created_at DESC`)
+      .all(cronJobId) as IConversationRow[];
+    const result: TChatConversation[] = [];
+    for (const row of rows) {
+      try {
+        result.push(rowToConversation(row));
+      } catch (e) {
+        console.warn('[Database] Skipping conversation row with unknown type:', row.type, row.id);
+      }
+    }
+    return result;
   }
 
   updateConversation(conversationId: string, updates: Partial<TChatConversation>): IQueryResult<boolean> {
@@ -724,8 +786,8 @@ export class AionUIDatabase {
       const row = messageToRow(message);
 
       const stmt = this.db.prepare(`
-        INSERT INTO messages (id, conversation_id, msg_id, type, content, position, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO messages (id, conversation_id, msg_id, type, content, position, status, hidden, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       stmt.run(
@@ -736,6 +798,7 @@ export class AionUIDatabase {
         row.content,
         row.position,
         row.status,
+        row.hidden ?? 0,
         row.created_at
       );
 
@@ -1075,6 +1138,7 @@ export class AionUIDatabase {
         INSERT INTO assistant_plugins (id, type, name, enabled, config, status, last_connected, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
+          type = excluded.type,
           name = excluded.name,
           enabled = excluded.enabled,
           config = excluded.config,
@@ -1395,6 +1459,191 @@ export class AionUIDatabase {
       return { success: true, data: result.changes };
     } catch (error: any) {
       return { success: false, error: error.message, data: 0 };
+    }
+  }
+
+  /**
+   * ==================
+   * Remote Agent operations
+   * ==================
+   */
+
+  getRemoteAgents(): RemoteAgentConfig[] {
+    try {
+      const rows = this.db.prepare('SELECT * FROM remote_agents ORDER BY created_at DESC').all() as Array<{
+        id: string;
+        name: string;
+        protocol: string;
+        url: string;
+        auth_type: string;
+        auth_token: string | null;
+        avatar: string | null;
+        description: string | null;
+        device_id: string | null;
+        device_public_key: string | null;
+        device_private_key: string | null;
+        device_token: string | null;
+        allow_insecure: number | null;
+        status: string | null;
+        last_connected_at: number | null;
+        created_at: number;
+        updated_at: number;
+      }>;
+
+      return rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        protocol: row.protocol as RemoteAgentConfig['protocol'],
+        url: row.url,
+        authType: row.auth_type as RemoteAgentConfig['authType'],
+        authToken: row.auth_token ? decryptString(row.auth_token) : undefined,
+        allowInsecure: !!row.allow_insecure,
+        avatar: row.avatar ?? undefined,
+        description: row.description ?? undefined,
+        deviceId: row.device_id ?? undefined,
+        devicePublicKey: row.device_public_key ? decryptString(row.device_public_key) : undefined,
+        devicePrivateKey: row.device_private_key ? decryptString(row.device_private_key) : undefined,
+        deviceToken: row.device_token ? decryptString(row.device_token) : undefined,
+        status: (row.status as RemoteAgentStatus) ?? 'unknown',
+        lastConnectedAt: row.last_connected_at ?? undefined,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      }));
+    } catch (error) {
+      console.error('[Database] getRemoteAgents error:', error);
+      return [];
+    }
+  }
+
+  getRemoteAgent(id: string): RemoteAgentConfig | null {
+    try {
+      const row = this.db.prepare('SELECT * FROM remote_agents WHERE id = ?').get(id) as
+        | {
+            id: string;
+            name: string;
+            protocol: string;
+            url: string;
+            auth_type: string;
+            auth_token: string | null;
+            avatar: string | null;
+            description: string | null;
+            device_id: string | null;
+            device_public_key: string | null;
+            device_private_key: string | null;
+            device_token: string | null;
+            allow_insecure: number | null;
+            status: string | null;
+            last_connected_at: number | null;
+            created_at: number;
+            updated_at: number;
+          }
+        | undefined;
+
+      if (!row) return null;
+
+      return {
+        id: row.id,
+        name: row.name,
+        protocol: row.protocol as RemoteAgentConfig['protocol'],
+        url: row.url,
+        authType: row.auth_type as RemoteAgentConfig['authType'],
+        authToken: row.auth_token ? decryptString(row.auth_token) : undefined,
+        allowInsecure: !!row.allow_insecure,
+        avatar: row.avatar ?? undefined,
+        description: row.description ?? undefined,
+        deviceId: row.device_id ?? undefined,
+        devicePublicKey: row.device_public_key ? decryptString(row.device_public_key) : undefined,
+        devicePrivateKey: row.device_private_key ? decryptString(row.device_private_key) : undefined,
+        deviceToken: row.device_token ? decryptString(row.device_token) : undefined,
+        status: (row.status as RemoteAgentStatus) ?? 'unknown',
+        lastConnectedAt: row.last_connected_at ?? undefined,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      };
+    } catch (error) {
+      console.error('[Database] getRemoteAgent error:', error);
+      return null;
+    }
+  }
+
+  createRemoteAgent(config: RemoteAgentConfig): IQueryResult<RemoteAgentConfig> {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO remote_agents (id, name, protocol, url, auth_type, auth_token, allow_insecure, avatar, description, device_id, device_public_key, device_private_key, device_token, status, last_connected_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          config.id,
+          config.name,
+          config.protocol,
+          config.url,
+          config.authType,
+          config.authToken ? encryptString(config.authToken) : null,
+          config.allowInsecure ? 1 : 0,
+          config.avatar ?? null,
+          config.description ?? null,
+          config.deviceId ?? null,
+          config.devicePublicKey ? encryptString(config.devicePublicKey) : null,
+          config.devicePrivateKey ? encryptString(config.devicePrivateKey) : null,
+          config.deviceToken ? encryptString(config.deviceToken) : null,
+          config.status ?? 'unknown',
+          config.lastConnectedAt ?? null,
+          config.createdAt,
+          config.updatedAt
+        );
+      return { success: true, data: config };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  updateRemoteAgent(
+    id: string,
+    updates: Partial<{
+      name: string;
+      protocol: string;
+      url: string;
+      auth_type: string;
+      auth_token: string;
+      avatar: string;
+      description: string;
+      device_id: string;
+      device_public_key: string;
+      device_private_key: string;
+      device_token: string;
+      allow_insecure: number;
+      status: string;
+      last_connected_at: number;
+    }>
+  ): IQueryResult<boolean> {
+    const ENCRYPTED_FIELDS = new Set(['auth_token', 'device_public_key', 'device_private_key', 'device_token']);
+    try {
+      const sets: string[] = [];
+      const values: unknown[] = [];
+
+      for (const [key, value] of Object.entries(updates)) {
+        sets.push(`${key} = ?`);
+        values.push(ENCRYPTED_FIELDS.has(key) && typeof value === 'string' ? encryptString(value) : (value ?? null));
+      }
+
+      sets.push('updated_at = ?');
+      values.push(Date.now());
+      values.push(id);
+
+      this.db.prepare(`UPDATE remote_agents SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+      return { success: true, data: true };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  deleteRemoteAgent(id: string): IQueryResult<boolean> {
+    try {
+      const result = this.db.prepare('DELETE FROM remote_agents WHERE id = ?').run(id);
+      return { success: true, data: result.changes > 0 };
+    } catch (error: any) {
+      return { success: false, error: error.message };
     }
   }
 

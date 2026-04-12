@@ -162,6 +162,9 @@ export class GeminiAgent {
     currentGeminiAgent = this;
 
     this.bootstrap = this.initialize();
+    // Prevent unhandled rejection when initialize fails (e.g. missing OAuth credentials).
+    // The error still propagates when callers `await this.bootstrap` in send().
+    this.bootstrap.catch(() => {});
   }
 
   private initClientEnv() {
@@ -331,6 +334,18 @@ export class GeminiAgent {
   private async initialize(): Promise<void> {
     const path = this.workspace;
 
+    // Ensure workspace directory exists before loading config.
+    // The temp directory created by buildWorkspaceWidthFiles may have been removed
+    // by OS cleanup or antivirus before the worker process starts initialization.
+    // loadServerHierarchicalMemory calls fs.realpath(workspace) without try-catch,
+    // causing an unhandled ENOENT rejection (Sentry ELECTRON-6W).
+    await fs.promises.mkdir(path, { recursive: true });
+
+    // Verify workspace is resolvable before aioncli-core attempts fs.realpath()
+    // internally. The mkdir above handles ENOENT, but EACCES (permission denied)
+    // still causes an unhandled rejection inside the library (Sentry ELECTRON-BM).
+    await fs.promises.realpath(path);
+
     const settings = loadSettings(path).merged;
     if (this.contextFileName) {
       settings.contextFileName = this.contextFileName;
@@ -358,6 +373,17 @@ export class GeminiAgent {
       enabledSkills: this.enabledSkills,
     });
     await this.config.initialize();
+
+    // aioncli-core skips awaiting MCP server connections when interactive=true
+    // (Config._initialize fires startConfiguredMcpServers without await).
+    // For team mode we MUST have MCP tools ready before the first message,
+    // so explicitly await MCP discovery here when team MCP servers are configured.
+    if (Object.keys(this.mcpServers).length > 0) {
+      const mcpMgr = this.config.getMcpClientManager?.();
+      if (mcpMgr) {
+        await mcpMgr.startConfiguredMcpServers();
+      }
+    }
 
     // aioncli-core 的 SkillManager.discoverSkills() 会重新从用户 skills 目录加载所有 skills
     // 覆盖了 loadCliConfig 中的过滤，需要在这里重新应用 enabledSkills 过滤
@@ -545,7 +571,7 @@ export class GeminiAgent {
         this.onStreamEvent({
           type: 'error',
           data: `Connection lost: ${event.reason}. Please try again.`,
-          msg_id,
+          msg_id: uuid(),
         });
       }
     };
@@ -588,9 +614,11 @@ export class GeminiAgent {
           return;
         }
 
+        // Use a fresh msg_id for error events so error/tips messages don't
+        // replace already-streamed content that shares the original msg_id.
         this.onStreamEvent({
           ...data,
-          msg_id,
+          msg_id: data.type === 'error' ? uuid() : msg_id,
         });
       },
       { onConnectionEvent }
@@ -627,7 +655,7 @@ export class GeminiAgent {
           this.onStreamEvent({
             type: 'error',
             data: 'Invalid response stream detected after multiple retries. Please try again.',
-            msg_id,
+            msg_id: uuid(),
           });
           return;
         }
@@ -659,10 +687,12 @@ export class GeminiAgent {
         for (const req of toolCallRequests) {
           globalToolCallGuard.unprotect(req.callId);
         }
+        // Use a fresh msg_id so the error message does not replace
+        // already-streamed content that shares the same msg_id.
         this.onStreamEvent({
           type: 'error',
           data: errorMessage,
-          msg_id,
+          msg_id: uuid(),
         });
       });
   }
@@ -745,7 +775,7 @@ export class GeminiAgent {
           this.onStreamEvent({
             type: 'error',
             data: errorMessage,
-            msg_id,
+            msg_id: uuid(),
           });
         })
         .finally(() => {
@@ -762,13 +792,20 @@ export class GeminiAgent {
       this.onStreamEvent({
         type: 'error',
         data: errorMessage,
-        msg_id,
+        msg_id: uuid(),
       });
     }
   }
 
   async send(message: string | Array<{ text: string }>, msg_id = '', files?: string[]) {
-    await this.bootstrap;
+    try {
+      await this.bootstrap;
+    } catch (e) {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      this.onStreamEvent({ type: 'error', data: errorMessage, msg_id });
+      this.onStreamEvent({ type: 'finish', data: null, msg_id });
+      return;
+    }
     const abortController = this.createAbortController();
 
     const stripFilesMarker = (text: string): string => {
@@ -909,9 +946,14 @@ export class GeminiAgent {
   async injectConversationHistory(text: string): Promise<void> {
     try {
       if (!this.config || !this.workspace || !this.settings) return;
+      if (this.geminiClient) {
+        await this.geminiClient.resetChat();
+      }
+
       // Prepare one-time prefix for first outgoing message after (re)start
       this.historyPrefix = `Conversation history (recent):\n${text}\n\n`;
       this.historyUsedOnce = false;
+      this.skillsIndexPrependedOnce = false;
       // 使用 refreshServerHierarchicalMemory 刷新 memory，然后追加聊天历史
       // Use refreshServerHierarchicalMemory to refresh memory, then append chat history
       const { memoryContent } = await refreshServerHierarchicalMemory(this.config);

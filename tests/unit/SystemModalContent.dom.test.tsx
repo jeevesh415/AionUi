@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import React from 'react';
 import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
 
+const mockIsElectronDesktop = vi.fn(() => true);
+
 // Mock window.matchMedia for Arco Design responsive observer
 Object.defineProperty(window, 'matchMedia', {
   writable: true,
@@ -36,11 +38,15 @@ vi.mock('@arco-design/web-react', async (importOriginal) => {
       error: vi.fn(),
       loading: vi.fn(() => vi.fn()),
     },
-    Modal: Object.assign(actual.Modal, { useModal: () => [{ confirm: vi.fn() }, <div key='modal-holder' />] }),
+    Modal: Object.assign(actual.Modal, {
+      useModal: () => [{ confirm: vi.fn() }, <div key='modal-holder' />],
+    }),
   };
 });
 
 vi.mock('@icon-park/react', () => ({
+  Copy: () => <span data-testid='icon-copy' />,
+  Down: ({ className }: any) => <span data-testid='icon-down' className={className} />,
   FolderOpen: () => <span data-testid='icon-folder-open' />,
   FolderSearch: () => <span data-testid='icon-folder-search' />,
   Link: () => <span data-testid='icon-link' />,
@@ -58,6 +64,10 @@ vi.mock('@/renderer/components/settings/SettingsModal/settingsViewContext', () =
   useSettingsViewMode: () => 'modal',
 }));
 
+vi.mock('@/renderer/utils/platform', () => ({
+  isElectronDesktop: () => mockIsElectronDesktop(),
+}));
+
 // IPC Bridge mocks
 const mockGetCdpStatus = vi.fn();
 const mockUpdateCdpConfig = vi.fn();
@@ -70,12 +80,27 @@ const mockDevToolsStateChangedOn = vi.fn(() => vi.fn());
 const mockGetCloseToTray = vi.fn();
 const mockGetNotificationEnabled = vi.fn();
 const mockGetCronNotificationEnabled = vi.fn();
+const mockGetSaveUploadToWorkspace = vi.fn();
+const mockGetCommandQueueEnabled = vi.fn();
+const mockGetAutoPreviewOfficeFiles = vi.fn();
 const mockSetCloseToTray = vi.fn();
 const mockSetNotificationEnabled = vi.fn();
 const mockSetCronNotificationEnabled = vi.fn();
+const mockSetSaveUploadToWorkspace = vi.fn();
+const mockSetCommandQueueEnabled = vi.fn();
+const mockSetAutoPreviewOfficeFiles = vi.fn();
 const mockOpenFile = vi.fn();
 const mockShowOpen = vi.fn();
 const mockUpdateSystemInfo = vi.fn();
+const mockGetStartOnBootStatus = vi.fn();
+const mockSetStartOnBoot = vi.fn();
+
+vi.mock('@/common/config/storage', () => ({
+  ConfigStorage: {
+    get: vi.fn().mockResolvedValue(undefined),
+    set: vi.fn().mockResolvedValue(undefined),
+  },
+}));
 
 vi.mock('@/common', () => ({
   ipcBridge: {
@@ -84,6 +109,8 @@ vi.mock('@/common', () => ({
       updateCdpConfig: { invoke: (...args: any[]) => mockUpdateCdpConfig(...args) },
       restart: { invoke: (...args: any[]) => mockRestart(...args) },
       systemInfo: { invoke: (...args: any[]) => mockSystemInfo(...args) },
+      getStartOnBootStatus: { invoke: (...args: any[]) => mockGetStartOnBootStatus(...args) },
+      setStartOnBoot: { invoke: (...args: any[]) => mockSetStartOnBoot(...args) },
       isDevToolsOpened: { invoke: (...args: any[]) => mockIsDevToolsOpened(...args) },
       openDevTools: { invoke: (...args: any[]) => mockOpenDevTools(...args) },
       devToolsStateChanged: { on: (...args: any[]) => mockDevToolsStateChangedOn(...args) },
@@ -92,10 +119,32 @@ vi.mock('@/common', () => ({
     systemSettings: {
       getCloseToTray: { invoke: (...args: any[]) => mockGetCloseToTray(...args) },
       getNotificationEnabled: { invoke: (...args: any[]) => mockGetNotificationEnabled(...args) },
-      getCronNotificationEnabled: { invoke: (...args: any[]) => mockGetCronNotificationEnabled(...args) },
+      getCronNotificationEnabled: {
+        invoke: (...args: any[]) => mockGetCronNotificationEnabled(...args),
+      },
+      getSaveUploadToWorkspace: {
+        invoke: (...args: any[]) => mockGetSaveUploadToWorkspace(...args),
+      },
+      getCommandQueueEnabled: {
+        invoke: (...args: any[]) => mockGetCommandQueueEnabled(...args),
+      },
+      getAutoPreviewOfficeFiles: {
+        invoke: (...args: any[]) => mockGetAutoPreviewOfficeFiles(...args),
+      },
       setCloseToTray: { invoke: (...args: any[]) => mockSetCloseToTray(...args) },
       setNotificationEnabled: { invoke: (...args: any[]) => mockSetNotificationEnabled(...args) },
-      setCronNotificationEnabled: { invoke: (...args: any[]) => mockSetCronNotificationEnabled(...args) },
+      setCronNotificationEnabled: {
+        invoke: (...args: any[]) => mockSetCronNotificationEnabled(...args),
+      },
+      setSaveUploadToWorkspace: {
+        invoke: (...args: any[]) => mockSetSaveUploadToWorkspace(...args),
+      },
+      setCommandQueueEnabled: {
+        invoke: (...args: any[]) => mockSetCommandQueueEnabled(...args),
+      },
+      setAutoPreviewOfficeFiles: {
+        invoke: (...args: any[]) => mockSetAutoPreviewOfficeFiles(...args),
+      },
     },
     dialog: {
       showOpen: { invoke: (...args: any[]) => mockShowOpen(...args) },
@@ -113,8 +162,8 @@ let swrMutateCallback: ((key: string) => void) | null = null;
 
 vi.mock('swr', () => {
   const useSWR = (key: string, fetcher: () => Promise<any>) => {
-    const [data, setData] = React.useState<any>(undefined);
-    const [isLoading, setIsLoading] = React.useState(true);
+    const [data, setData] = React.useState<any>(() => swrCache[key]);
+    const [isLoading, setIsLoading] = React.useState(() => swrCache[key] === undefined);
 
     React.useEffect(() => {
       if (swrCache[key] !== undefined) {
@@ -160,6 +209,7 @@ describe('SystemModalContent', () => {
     vi.clearAllMocks();
     swrCache = {};
     swrMutateCallback = null;
+    mockIsElectronDesktop.mockReturnValue(true);
 
     // Default mock implementations
     mockGetCdpStatus.mockResolvedValue({
@@ -176,10 +226,37 @@ describe('SystemModalContent', () => {
       workDir: '/tmp/work',
       logDir: '/tmp/logs',
     });
+    mockGetStartOnBootStatus.mockResolvedValue({
+      success: true,
+      data: {
+        supported: true,
+        enabled: false,
+        isPackaged: true,
+        platform: 'darwin',
+      },
+    });
+    mockSetStartOnBoot.mockResolvedValue({
+      success: true,
+      data: {
+        supported: true,
+        enabled: true,
+        isPackaged: true,
+        platform: 'darwin',
+      },
+    });
     mockIsDevToolsOpened.mockResolvedValue(false);
     mockGetCloseToTray.mockResolvedValue(false);
     mockGetNotificationEnabled.mockResolvedValue(true);
     mockGetCronNotificationEnabled.mockResolvedValue(false);
+    mockGetSaveUploadToWorkspace.mockResolvedValue(false);
+    mockGetCommandQueueEnabled.mockResolvedValue(false);
+    mockGetAutoPreviewOfficeFiles.mockResolvedValue(true);
+    mockSetCloseToTray.mockResolvedValue(undefined);
+    mockSetNotificationEnabled.mockResolvedValue(undefined);
+    mockSetCronNotificationEnabled.mockResolvedValue(undefined);
+    mockSetSaveUploadToWorkspace.mockResolvedValue(undefined);
+    mockSetCommandQueueEnabled.mockResolvedValue(undefined);
+    mockSetAutoPreviewOfficeFiles.mockResolvedValue(undefined);
   });
 
   it('should render system settings with language switcher and preferences', async () => {
@@ -190,7 +267,171 @@ describe('SystemModalContent', () => {
     });
 
     expect(screen.getByText('settings.language')).toBeInTheDocument();
+    expect(screen.getByText('settings.startOnBoot')).toBeInTheDocument();
     expect(screen.getByText('settings.closeToTray')).toBeInTheDocument();
+    expect(screen.getByText('settings.saveUploadToWorkspace')).toBeInTheDocument();
+    expect(screen.getByText('settings.commandQueueEnabled')).toBeInTheDocument();
+    expect(screen.getByText('settings.commandQueueEnabledDesc')).toBeInTheDocument();
+    expect(screen.getByText('settings.autoPreviewOfficeFiles')).toBeInTheDocument();
+    expect(screen.getByText('settings.autoPreviewOfficeFilesDesc')).toBeInTheDocument();
+  });
+
+  it('should toggle command queue when the switch is clicked', async () => {
+    render(<SystemModalContent />);
+
+    await waitFor(() => {
+      expect(screen.getByText('settings.commandQueueEnabled')).toBeInTheDocument();
+    });
+
+    const commandQueueSection = screen.getByText('settings.commandQueueEnabled').closest('.flex-1')?.parentElement;
+    const commandQueueSwitch = commandQueueSection?.querySelector('button[role="switch"]');
+    expect(commandQueueSwitch).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(commandQueueSwitch!);
+    });
+
+    await waitFor(() => {
+      expect(mockSetCommandQueueEnabled).toHaveBeenCalledWith({ enabled: true });
+    });
+  });
+
+  it('should revert command queue when the bridge rejects', async () => {
+    mockSetCommandQueueEnabled.mockRejectedValue(new Error('bridge rejected'));
+
+    render(<SystemModalContent />);
+
+    await waitFor(() => {
+      expect(screen.getByText('settings.commandQueueEnabled')).toBeInTheDocument();
+    });
+
+    const commandQueueSection = screen.getByText('settings.commandQueueEnabled').closest('.flex-1')?.parentElement;
+    const commandQueueSwitch = commandQueueSection?.querySelector('button[role="switch"]');
+
+    expect(commandQueueSwitch).toHaveAttribute('aria-checked', 'false');
+
+    await act(async () => {
+      fireEvent.click(commandQueueSwitch!);
+    });
+
+    await waitFor(() => {
+      expect(mockSetCommandQueueEnabled).toHaveBeenCalledWith({ enabled: true });
+      expect(commandQueueSwitch).toHaveAttribute('aria-checked', 'false');
+    });
+  });
+
+  it('should toggle start on boot when the switch is clicked', async () => {
+    render(<SystemModalContent />);
+
+    await waitFor(() => {
+      expect(screen.getByText('settings.startOnBoot')).toBeInTheDocument();
+    });
+
+    const startOnBootSection = screen.getByText('settings.startOnBoot').closest('.flex-1')?.parentElement;
+    const startOnBootSwitch = startOnBootSection?.querySelector('button[role="switch"]');
+    expect(startOnBootSwitch).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(startOnBootSwitch!);
+    });
+
+    await waitFor(() => {
+      expect(mockSetStartOnBoot).toHaveBeenCalledWith({ enabled: true });
+    });
+  });
+
+  it('should keep start on boot disabled when the feature is unsupported', async () => {
+    mockGetStartOnBootStatus.mockResolvedValue({
+      success: true,
+      data: {
+        supported: false,
+        enabled: false,
+        isPackaged: false,
+        platform: 'linux',
+      },
+    });
+
+    render(<SystemModalContent />);
+
+    await waitFor(() => {
+      expect(screen.getByText('settings.startOnBootUnsupported')).toBeInTheDocument();
+    });
+
+    const startOnBootSection = screen.getByText('settings.startOnBoot').closest('.flex-1')?.parentElement;
+    const startOnBootSwitch = startOnBootSection?.querySelector('button[role="switch"]');
+    expect(startOnBootSwitch).toHaveAttribute('aria-checked', 'false');
+    expect(startOnBootSwitch).toBeDisabled();
+  });
+
+  it('should not request start-on-boot status outside the desktop runtime', async () => {
+    mockIsElectronDesktop.mockReturnValue(false);
+
+    render(<SystemModalContent />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('language-switcher')).toBeInTheDocument();
+    });
+
+    expect(mockGetStartOnBootStatus).not.toHaveBeenCalled();
+  });
+
+  it('should show the backend error and revert the switch when updating start on boot fails', async () => {
+    mockSetStartOnBoot.mockResolvedValue({
+      success: false,
+      msg: 'login item update failed',
+      data: {
+        supported: true,
+        enabled: false,
+        isPackaged: true,
+        platform: 'darwin',
+      },
+    });
+
+    const { Message } = await import('@arco-design/web-react');
+
+    render(<SystemModalContent />);
+
+    await waitFor(() => {
+      expect(screen.getByText('settings.startOnBoot')).toBeInTheDocument();
+    });
+
+    const startOnBootSection = screen.getByText('settings.startOnBoot').closest('.flex-1')?.parentElement;
+    const startOnBootSwitch = startOnBootSection?.querySelector('button[role="switch"]');
+
+    await act(async () => {
+      fireEvent.click(startOnBootSwitch!);
+    });
+
+    await waitFor(() => {
+      expect(Message.error).toHaveBeenCalledWith('login item update failed');
+    });
+
+    expect(startOnBootSwitch).toHaveAttribute('aria-checked', 'false');
+  });
+
+  it('should show the fallback error when updating start on boot rejects', async () => {
+    mockSetStartOnBoot.mockRejectedValue(new Error('bridge rejected'));
+
+    const { Message } = await import('@arco-design/web-react');
+
+    render(<SystemModalContent />);
+
+    await waitFor(() => {
+      expect(screen.getByText('settings.startOnBoot')).toBeInTheDocument();
+    });
+
+    const startOnBootSection = screen.getByText('settings.startOnBoot').closest('.flex-1')?.parentElement;
+    const startOnBootSwitch = startOnBootSection?.querySelector('button[role="switch"]');
+
+    await act(async () => {
+      fireEvent.click(startOnBootSwitch!);
+    });
+
+    await waitFor(() => {
+      expect(Message.error).toHaveBeenCalledWith('settings.startOnBootUpdateFailed');
+    });
+
+    expect(startOnBootSwitch).toHaveAttribute('aria-checked', 'false');
   });
 
   it('should render DevTools toggle button', async () => {
@@ -205,6 +446,35 @@ describe('SystemModalContent', () => {
 
   it('should toggle DevTools when button is clicked', async () => {
     mockIsDevToolsOpened.mockResolvedValue(false);
+    const openPromise = Promise.resolve(true);
+    mockOpenDevTools.mockReturnValue(openPromise);
+
+    render(<SystemModalContent />);
+
+    await waitFor(() => {
+      expect(screen.getByText('settings.openDevTools')).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings.openDevTools'));
+      await openPromise;
+    });
+
+    expect(mockOpenDevTools).toHaveBeenCalled();
+
+    await waitFor(() => {
+      expect(screen.getByText('settings.closeDevTools')).toBeInTheDocument();
+    });
+  });
+
+  it('should not let stale initial DevTools state overwrite a user toggle', async () => {
+    let resolveInitialState: ((value: boolean) => void) | null = null;
+    mockIsDevToolsOpened.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveInitialState = resolve;
+        })
+    );
     mockOpenDevTools.mockResolvedValue(true);
 
     render(<SystemModalContent />);
@@ -217,11 +487,16 @@ describe('SystemModalContent', () => {
       fireEvent.click(screen.getByText('settings.openDevTools'));
     });
 
-    expect(mockOpenDevTools).toHaveBeenCalled();
-
     await waitFor(() => {
       expect(screen.getByText('settings.closeDevTools')).toBeInTheDocument();
     });
+
+    await act(async () => {
+      resolveInitialState?.(false);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('settings.closeDevTools')).toBeInTheDocument();
   });
 
   it('should update DevTools state via event listener', async () => {
@@ -403,10 +678,32 @@ describe('SystemModalContent', () => {
         expect(screen.getByText('settings.cdp.mcpConfig')).toBeInTheDocument();
       });
 
-      // Check MCP config contains the port
-      const preElement = screen.getByText(/chrome-devtools-mcp@0\.16\.0/);
-      expect(preElement).toBeInTheDocument();
-      expect(preElement.textContent).toContain('--browser-url=http://127.0.0.1:9230');
+      // Both MCP config entries should be visible as collapse headers
+      expect(screen.getByText('chrome-devtools')).toBeInTheDocument();
+      expect(screen.getByText('playwright')).toBeInTheDocument();
+    });
+
+    it('should hide port and MCP config when CDP is disabled', async () => {
+      mockGetCdpStatus.mockResolvedValue({
+        data: {
+          enabled: true,
+          configEnabled: false,
+          startupEnabled: false,
+          port: 9230,
+          isDevMode: true,
+        },
+      });
+
+      render(<SystemModalContent />);
+
+      await waitFor(() => {
+        expect(screen.getByText('settings.cdp.enable')).toBeInTheDocument();
+      });
+
+      expect(screen.queryByText('http://127.0.0.1:9230')).not.toBeInTheDocument();
+      expect(screen.queryByText('settings.cdp.mcpConfig')).not.toBeInTheDocument();
+      expect(screen.queryByText('chrome-devtools')).not.toBeInTheDocument();
+      expect(screen.queryByText('playwright')).not.toBeInTheDocument();
     });
 
     it('should open CDP URL in browser', async () => {

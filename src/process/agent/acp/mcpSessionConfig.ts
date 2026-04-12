@@ -6,6 +6,7 @@
 
 import type { IMcpServer } from '@/common/config/storage';
 import type { AcpResponse } from '@/common/types/acpTypes';
+import { TEAM_SUPPORTED_BACKENDS } from '@/common/types/teamTypes';
 
 export interface AcpSessionMcpNameValue {
   name: string;
@@ -13,11 +14,11 @@ export interface AcpSessionMcpNameValue {
 }
 
 export interface AcpSessionMcpServerStdio {
-  type: 'stdio';
+  type?: 'stdio';
   name: string;
   command: string;
-  args?: string[];
-  env?: AcpSessionMcpNameValue[];
+  args: string[];
+  env: AcpSessionMcpNameValue[];
 }
 
 export interface AcpSessionMcpServerHttpLike {
@@ -98,7 +99,7 @@ export function buildBuiltinAcpSessionMcpServers(
             name: server.name,
             command: server.transport.command,
             args: server.transport.args || [],
-            env: toNameValueEntries(server.transport.env),
+            env: toNameValueEntries(server.transport.env) ?? [],
           };
         case 'http':
         case 'streamable_http':
@@ -122,4 +123,33 @@ export function buildBuiltinAcpSessionMcpServers(
       }
     })
     .filter((server): server is AcpSessionMcpServer => server !== null);
+}
+
+/**
+ * ACP backends that are allowed to receive the Aion team-guide MCP server.
+ * Re-exported from teamTypes — single source of truth.
+ */
+export { TEAM_SUPPORTED_BACKENDS as TEAM_GUIDE_ALLOWED_BACKENDS };
+
+/** Config shape passed from TeamSessionService to AgentManagers */
+export type TeamMcpStdioConfig = {
+  name: string;
+  command: string;
+  args: string[];
+  env: AcpSessionMcpNameValue[];
+};
+
+/**
+ * Build the AcpSessionMcpServer entry for a team MCP stdio server.
+ * Returns null if the config is missing or has no command — callers should
+ * simply skip injection in that case.
+ */
+export function buildTeamMcpServer(config: TeamMcpStdioConfig | undefined | null): AcpSessionMcpServerStdio | null {
+  if (!config || !config.command) return null;
+  return {
+    name: config.name,
+    command: config.command,
+    args: config.args,
+    env: config.env,
+  };
 }
