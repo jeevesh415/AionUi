@@ -390,6 +390,7 @@ export class GeminiAgentManager extends BaseAgentManager<
             aionEnvObj[name] = value;
           }
           aionEnvObj['AION_MCP_BACKEND'] = 'gemini';
+          aionEnvObj['AION_MCP_CONVERSATION_ID'] = this.conversation_id;
           mcpConfig[aionStdioConfig.name] = {
             command: aionStdioConfig.command,
             args: aionStdioConfig.args || [],
@@ -830,9 +831,11 @@ export class GeminiAgentManager extends BaseAgentManager<
       const filteredData = this.filterThinkTagsFromMessage(data);
       ipcBridge.geminiConversation.responseStream.emit(filteredData);
 
-      // Also emit to main-process-local bus so TeammateManager (same process)
-      // can receive events — ipcBridge.emit only delivers to renderer via webContents.send()
-      teamEventBus.emit('responseStream', filteredData);
+      // Emit terminal events to main-process-local bus so TeammateManager can
+      // manage agent lifecycle — ipcBridge.emit only delivers to renderer via webContents.send()
+      if (filteredData.type === 'finish' || filteredData.type === 'error') {
+        teamEventBus.emit('responseStream', filteredData);
+      }
 
       // Emit to Channel global event bus (for Telegram and other external platforms)
       channelEventBus.emitAgentMessage(this.conversation_id, filteredData);
