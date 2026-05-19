@@ -9,6 +9,7 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { TProviderWithModel } from '@/common/config/storage';
+import { getEnhancedEnv } from '@process/utils/shellEnv';
 import { resolveAionrsBinary } from './binaryResolver';
 import { buildSpawnConfig } from './envBuilder';
 import type { AionrsEvent, AionrsCommand, AionrsCapabilities } from './protocol';
@@ -16,6 +17,21 @@ import type { AionrsEvent, AionrsCommand, AionrsCapabilities } from './protocol'
 const AIONRS_PROJECT_CONFIG = '.aionrs.toml';
 
 type StreamEventHandler = (event: { type: string; data: unknown; msg_id: string }) => void;
+
+/**
+ * A stdio-transport MCP server to inject into the aionrs session. Each entry
+ * is forwarded verbatim as an `add_mcp_server` command. `awaitReady` flags
+ * that the server performs a ready handshake (e.g. team coordination MCP
+ * waits for TEAM_AGENT_SLOT_ID registration); leave it false for fire-and-
+ * forget servers like the team-guide bridge.
+ */
+export type StdioMcpOption = {
+  name: string;
+  command: string;
+  args: string[];
+  env: Array<{ name: string; value: string }>;
+  awaitReady?: boolean;
+};
 
 export type AionrsAgentOptions = {
   workspace: string;
@@ -27,7 +43,15 @@ export type AionrsAgentOptions = {
   maxTurns?: number;
   sessionId?: string;
   resume?: string;
+  /**
+   * Stdio MCP servers to register with the aionrs session after start.
+   * Caller decides which MCPs belong here (team coordination, team-guide,
+   * future project MCPs, etc.) — AionrsAgent just forwards them.
+   */
+  stdioMcpServers?: StdioMcpOption[];
   onStreamEvent: StreamEventHandler;
+  onProcessExit?: (code: number | null, activeMsgId: string) => void;
+  onPong?: () => void;
 };
 
 export class AionrsAgent {
@@ -37,18 +61,27 @@ export class AionrsAgent {
   private readyResolve!: () => void;
   private readyReject!: (err: Error) => void;
   private onStreamEvent: StreamEventHandler;
+  private _onProcessExit: AionrsAgentOptions['onProcessExit'];
+  private _onPong: AionrsAgentOptions['onPong'];
   private options: AionrsAgentOptions;
   private activeMsgId: string | null = null;
   private configBackup: { path: string; content: string | null } | null = null;
+  private mcpReadyPromise: Promise<void>;
+  private mcpReadyResolve!: () => void;
   public sessionId?: string;
   public capabilities?: AionrsCapabilities;
 
   constructor(options: AionrsAgentOptions) {
     this.options = options;
     this.onStreamEvent = options.onStreamEvent;
+    this._onProcessExit = options.onProcessExit;
+    this._onPong = options.onPong;
     this.readyPromise = new Promise((resolve, reject) => {
       this.readyResolve = resolve;
       this.readyReject = reject;
+    });
+    this.mcpReadyPromise = new Promise((resolve) => {
+      this.mcpReadyResolve = resolve;
     });
   }
 
@@ -77,7 +110,7 @@ export class AionrsAgent {
     }
 
     this.childProcess = spawn(binaryPath, args, {
-      env: { ...process.env, ...env },
+      env: getEnhancedEnv(env),
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.options.workspace,
     });
@@ -104,6 +137,10 @@ export class AionrsAgent {
       if (!this.ready) {
         this.readyReject(new Error(`aionrs exited with code ${code} during init`));
       }
+      if (this.activeMsgId && this._onProcessExit) {
+        this._onProcessExit(code, this.activeMsgId);
+      }
+      this.activeMsgId = null;
       this.childProcess = null;
     });
 
@@ -127,6 +164,36 @@ export class AionrsAgent {
         return this.start();
       }
       throw err;
+    }
+
+    // Inject stdio MCP servers (must happen before first message). Each entry
+    // is forwarded as `add_mcp_server`; if any entry has `awaitReady: true`,
+    // wait on the handshake before continuing.
+    const stdioMcpServers = this.options.stdioMcpServers ?? [];
+    let awaitAnyReady = false;
+    for (const server of stdioMcpServers) {
+      const envRecord: Record<string, string> = {};
+      for (const { name: k, value: v } of server.env) {
+        envRecord[k] = v;
+      }
+      this.sendCommand({
+        type: 'add_mcp_server',
+        name: server.name,
+        transport: 'stdio',
+        command: server.command,
+        args: server.args,
+        env: envRecord,
+      });
+      if (server.awaitReady) awaitAnyReady = true;
+    }
+
+    if (awaitAnyReady) {
+      await Promise.race([
+        this.mcpReadyPromise,
+        new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error('MCP ready timeout (30s)')), 30000)),
+      ]).catch((err) => {
+        console.warn('[AionrsAgent] MCP setup warning:', err);
+      });
     }
 
     // Inject preset rules as history context (skip on resume — rules were already injected)
@@ -258,6 +325,14 @@ export class AionrsAgent {
           msg_id: '',
         });
         break;
+
+      case 'mcp_ready':
+        this.mcpReadyResolve();
+        break;
+
+      case 'pong':
+        this._onPong?.();
+        break;
     }
   }
 
@@ -305,12 +380,12 @@ export class AionrsAgent {
     this.childProcess.stdin.write(JSON.stringify(cmd) + '\n');
   }
 
-  async send(input: string, msgId: string, files?: string[]): Promise<void> {
+  async send(content: string, msgId: string, files?: string[]): Promise<void> {
     await this.readyPromise;
     this.sendCommand({
       type: 'message',
       msg_id: msgId,
-      input,
+      content,
       files,
     });
   }
@@ -338,6 +413,14 @@ export class AionrsAgent {
 
   setMode(mode: 'default' | 'auto_edit' | 'yolo'): void {
     this.sendCommand({ type: 'set_mode', mode });
+  }
+
+  ping(): void {
+    this.sendCommand({ type: 'ping' });
+  }
+
+  get isAlive(): boolean {
+    return this.childProcess !== null;
   }
 
   kill(): void {

@@ -27,7 +27,7 @@ const mocks = vi.hoisted(() => ({
   initStarOfficeBridge: vi.fn(),
   initSpeechToTextBridge: vi.fn(),
   initHubBridge: vi.fn(),
-  initializeDetector: vi.fn(async () => {}),
+  initializeRegistry: vi.fn(async () => {}),
   loggerConfig: vi.fn(),
 }));
 
@@ -37,22 +37,22 @@ vi.mock('@office-ai/platform', () => ({
   },
 }));
 
-vi.mock('@process/agent/acp/AcpDetector', () => ({
-  acpDetector: {
-    initialize: (...args: unknown[]) => mocks.initializeDetector(...args),
+vi.mock('@process/agent/AgentRegistry', () => ({
+  agentRegistry: {
+    initialize: (...args: unknown[]) => mocks.initializeRegistry(...args),
   },
 }));
 
 vi.mock('@process/services/database/SqliteChannelRepository', () => ({
-  SqliteChannelRepository: class {},
+  SqliteChannelRepository: vi.fn(),
 }));
 
 vi.mock('@process/services/database/SqliteConversationRepository', () => ({
-  SqliteConversationRepository: class {},
+  SqliteConversationRepository: vi.fn(),
 }));
 
 vi.mock('@process/services/ConversationServiceImpl', () => ({
-  ConversationServiceImpl: class {},
+  ConversationServiceImpl: vi.fn(),
 }));
 
 vi.mock('@process/task/workerTaskManagerSingleton', () => ({
@@ -149,6 +149,6 @@ describe('initBridgeStandalone', () => {
     await mod.initBridgeStandalone();
 
     expect(mocks.initHubBridge).toHaveBeenCalledTimes(1);
-    expect(mocks.initializeDetector).toHaveBeenCalledTimes(1);
+    expect(mocks.initializeRegistry).toHaveBeenCalledTimes(1);
   });
 });

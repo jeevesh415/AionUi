@@ -1,9 +1,7 @@
-import type { PresetAgentType } from '@/common/types/acpTypes';
-
 export type AssistantPreset = {
   id: string;
   avatar: string;
-  presetAgentType?: PresetAgentType;
+  presetAgentType?: string;
   /**
    * Directory containing all resources for this preset (relative to project root).
    * If set, both ruleFiles and skillFiles will be resolved from this directory.
@@ -246,6 +244,56 @@ export const ASSISTANT_PRESETS: AssistantPreset[] = [
         '用这个 GLB 模型做一份产品展示 PPT。内容要围绕模型展开——它是什么、有什么特点、背后的故事。每页用不同视角配合主题：讲细节就特写、讲结构就俯视、讲气势就仰拍，画面要丰富有层次。',
         '这是我的 GLB 模型，仔细观察它，然后做一份电影感演示，模型是每一帧的主角。镜头要多变：推近看细节、拉远看全貌、模型出血到画面边缘做冲击转场。内容必须贴合模型本身。',
         '围绕这个 3D 模型做一份像电影预告片一样的演示。要有大气的高潮时刻、细腻的特写镜头、开阔的全景俯瞰。故事要契合模型本身的特征——不要用跟模型无关的通用文案。',
+      ],
+    },
+  },
+  {
+    id: 'word-form-creator',
+    avatar: '📋',
+    presetAgentType: 'gemini',
+    resourceDir: 'src/process/resources/assistant/word-form-creator',
+    ruleFiles: {
+      'en-US': 'word-form-creator.md',
+      'zh-CN': 'word-form-creator.zh-CN.md',
+      'ru-RU': 'word-form-creator.ru-RU.md',
+    },
+    defaultEnabledSkills: ['officecli-word-form'],
+    nameI18n: {
+      'en-US': 'Word Form Creator',
+      'zh-CN': '可填表单助手',
+      'ru-RU': 'Создатель форм Word',
+      'uk-UA': 'Створювач форм Word',
+    },
+    descriptionI18n: {
+      'en-US':
+        'Build fillable Word forms (.docx) with real content controls, checkbox fields, MERGEFIELD mail-merge placeholders, and document protection — only designated fields are editable, the rest stays locked. HR intakes, surveys, contract / SOW templates, compliance checklists, medical intake.',
+      'zh-CN':
+        '制作可填 Word 表单（.docx），支持真正的内容控件、复选框、邮件合并占位符和文档保护——只有指定字段可编辑，其他部分保持锁定。适用于 HR 入职表、问卷、合同 / SOW 模板、合规 checklist、医疗问诊表。',
+      'ru-RU':
+        'Создаёт заполняемые формы Word (.docx) с реальными элементами управления содержимым, флажками, полями MERGEFIELD и защитой документа — редактируются только заданные поля, остальное заблокировано. HR-анкеты, опросы, шаблоны контрактов / SOW, комплаенс-чеклисты, медицинские опросники.',
+      'uk-UA':
+        'Створюйте заповнювані форми Word (.docx) зі справжніми елементами керування вмістом, полями-прапорцями, MERGEFIELD для злиття пошти та захистом документа — редагуються лише задані поля, решта залишається заблокованою. HR-анкети, опитування, шаблони контрактів / SOW, комплаєнс-чеклисти, медичні анкети.',
+    },
+    promptsI18n: {
+      'en-US': [
+        'Build a new-hire onboarding .docx form with fields for full name, start date, department, manager, role-based training checklist, and equipment request checkboxes; only the fields are editable.',
+        'Create a SOW contract template .docx with mail-merge placeholders for client name, effective date, scope bullets, total fee, and signature blocks; protect everything except the signature area.',
+        'Make a medical intake questionnaire .docx with dropdown for reason of visit, text fields for allergies / current medication, checkbox grid for past conditions, and signature line at the bottom.',
+      ],
+      'zh-CN': [
+        '做一份新员工入职登记 .docx 表单，包含姓名、入职日期、部门、直属上级、岗位培训 checklist 和设备申请复选框；其他排版保护，只字段可填。',
+        '做一份 SOW 合同模板 .docx，邮件合并占位客户名、生效日期、工作范围 bullets、总费用、签署栏；签名区以外全部保护。',
+        '做一份医疗问诊表 .docx，就诊原因下拉、过敏史 / 正在服用药物文本字段、既往病史复选矩阵、末尾签名行。',
+      ],
+      'ru-RU': [
+        'Сделай .docx-форму приёма нового сотрудника с полями ФИО, дата начала, отдел, руководитель, чеклистом обучения по должности и флажками заявки на оборудование; редактируются только поля.',
+        'Создай шаблон контракта SOW .docx с MERGEFIELD-плейсхолдерами для имени клиента, даты вступления в силу, пунктов объёма работ, общей суммы и блока подписей; защитить всё, кроме области подписи.',
+        'Сделай .docx-анкету для медицинского приёма с выпадающим списком причины визита, текстовыми полями для аллергий / принимаемых лекарств, сеткой флажков по перенесённым заболеваниям и строкой подписи внизу.',
+      ],
+      'uk-UA': [
+        'Зроби .docx-форму прийому нового співробітника з полями ПІБ, дата початку, відділ, керівник, чек-листом навчання за посадою та прапорцями запиту обладнання; редагуються лише поля.',
+        'Створи шаблон контракту SOW .docx з MERGEFIELD-плейсхолдерами для імені клієнта, дати набрання чинності, обсягу робіт, загальної суми та блоку підписів; захисти все, крім області підпису.',
+        'Зроби .docx-анкету медичного прийому з випадаючим списком причини візиту, текстовими полями для алергій / прийнятих ліків, сіткою прапорців за минулими станами та рядком підпису внизу.',
       ],
     },
   },

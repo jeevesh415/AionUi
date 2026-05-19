@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { acpDetector } from '@process/agent/acp/AcpDetector';
+import { agentRegistry } from '@process/agent/AgentRegistry';
 import type { IChannelRepository } from '@process/services/database/IChannelRepository';
 import type { IConversationRepository } from '@process/services/database/IConversationRepository';
 import type { IConversationService } from '@process/services/IConversationService';
@@ -33,6 +33,7 @@ import { initTaskBridge } from './taskBridge';
 import { initUpdateBridge } from './updateBridge';
 import { initWebuiBridge } from './webuiBridge';
 import { initSystemSettingsBridge } from './systemSettingsBridge';
+import { initAmbientBridge } from './ambientBridge';
 import { initWindowControlsBridge } from './windowControlsBridge';
 import { initNotificationBridge } from './notificationBridge';
 import { initPptPreviewBridge } from './pptPreviewBridge';
@@ -83,6 +84,7 @@ export function initAllBridges(deps: BridgeDependencies): void {
   initExtensionsBridge(deps.conversationRepo, deps.workerTaskManager);
   initCronBridge();
   initSystemSettingsBridge();
+  initAmbientBridge();
   initNotificationBridge();
   initTaskBridge(deps.workerTaskManager);
   initStarOfficeBridge();
@@ -99,7 +101,7 @@ export function initAllBridges(deps: BridgeDependencies): void {
  */
 export async function initializeAcpDetector(): Promise<void> {
   try {
-    await acpDetector.initialize();
+    await agentRegistry.initialize();
   } catch (error) {
     console.error('[ACP] Failed to initialize detector:', error);
   }
@@ -132,6 +134,7 @@ export {
   initSpeechToTextBridge,
   initStarOfficeBridge,
   initSystemSettingsBridge,
+  initAmbientBridge,
   initTaskBridge,
   initUpdateBridge,
   initWebuiBridge,

@@ -170,6 +170,14 @@ describe('spawnNpxBackend - Windows UTF-8 fix', () => {
   });
 });
 
+const setWindowsPlatform = () => {
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+};
+
+const setLinuxPlatform = () => {
+  Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+};
+
 describe('createGenericSpawnConfig - Windows path handling', () => {
   let originalPlatform: PropertyDescriptor | undefined;
 
@@ -182,14 +190,6 @@ describe('createGenericSpawnConfig - Windows path handling', () => {
       Object.defineProperty(process, 'platform', originalPlatform);
     }
   });
-
-  const setWindowsPlatform = () => {
-    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-  };
-
-  const setLinuxPlatform = () => {
-    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
-  };
 
   it('returns plain command on non-Windows', () => {
     setLinuxPlatform();
@@ -275,7 +275,7 @@ describe('connectCodex - Windows diagnostics', () => {
       'codex.cmd',
       ['--version'],
       expect.objectContaining({
-        env: { PATH: '/usr/bin' },
+        env: expect.objectContaining({ PATH: '/usr/bin' }),
         shell: true,
         timeout: 5000,
         windowsHide: true,
@@ -287,7 +287,7 @@ describe('connectCodex - Windows diagnostics', () => {
       'codex.cmd',
       ['login', 'status'],
       expect.objectContaining({
-        env: { PATH: '/usr/bin' },
+        env: expect.objectContaining({ PATH: '/usr/bin' }),
         shell: true,
         timeout: 5000,
         windowsHide: true,
@@ -325,7 +325,7 @@ describe('connectClaude - detached process group', () => {
 
     expect(mockSpawn).toHaveBeenCalledWith(
       '/bundled/bun',
-      expect.arrayContaining(['x', '--bun', '@zed-industries/claude-agent-acp@0.21.0']),
+      expect.arrayContaining(['x', '--bun', '@agentclientprotocol/claude-agent-acp@0.29.2']),
       expect.objectContaining({
         cwd: '/cwd',
         detached: true,
@@ -349,7 +349,7 @@ describe('connectClaude - detached process group', () => {
 
     expect(mockSpawn).toHaveBeenCalledWith(
       '/bundled/bun',
-      expect.arrayContaining(['x', '--bun', '@zed-industries/claude-agent-acp@0.21.0']),
+      expect.arrayContaining(['x', '--bun', '@agentclientprotocol/claude-agent-acp@0.29.2']),
       expect.objectContaining({
         env: expect.objectContaining({
           PATH: '/usr/bin',
@@ -370,7 +370,7 @@ describe('connectClaude - detached process group', () => {
 
     expect(mockSpawn).toHaveBeenCalledWith(
       expect.stringContaining('chcp 65001 >nul &&'),
-      expect.arrayContaining(['x', '--bun', '@zed-industries/claude-agent-acp@0.21.0']),
+      expect.arrayContaining(['x', '--bun', '@agentclientprotocol/claude-agent-acp@0.29.2']),
       expect.objectContaining({
         cwd: 'C:\\cwd',
         detached: false,
@@ -548,7 +548,7 @@ describe('connectCodex - Linux package selection', () => {
     expect(command).toBe('/bundled/bun');
     expect(args).toContain('x');
     expect(args).toContain('--bun');
-    expect(args).toContain('@zed-industries/codex-acp-linux-x64');
+    expect(args).toContain('@zed-industries/codex-acp-linux-x64@0.9.5');
   });
 
   it('uses the direct Linux platform package first when startup succeeds', async () => {
@@ -560,7 +560,7 @@ describe('connectCodex - Linux package selection', () => {
     await connectCodex('/cwd', hooks);
 
     const [, args] = mockSpawn.mock.calls[0];
-    expect(args).toContain('@zed-industries/codex-acp-linux-x64');
+    expect(args).toContain('@zed-industries/codex-acp-linux-x64@0.9.5');
     expect(args).not.toContain('@zed-industries/codex-acp@0.9.5');
     expect(mockChild.unref).not.toHaveBeenCalled();
   });
@@ -569,7 +569,7 @@ describe('connectCodex - Linux package selection', () => {
     const hooks = {
       setup: vi.fn(async () => {
         const [, args] = mockSpawn.mock.calls.at(-1) ?? [];
-        if (Array.isArray(args) && args.includes('@zed-industries/codex-acp-linux-x64')) {
+        if (Array.isArray(args) && args.includes('@zed-industries/codex-acp-linux-x64@0.9.5')) {
           throw new Error('Request initialize timed out after 60 seconds');
         }
       }),
@@ -581,7 +581,7 @@ describe('connectCodex - Linux package selection', () => {
     const firstCallArgs = mockSpawn.mock.calls[0]?.[1];
     const secondCallArgs = mockSpawn.mock.calls[1]?.[1];
 
-    expect(firstCallArgs).toContain('@zed-industries/codex-acp-linux-x64');
+    expect(firstCallArgs).toContain('@zed-industries/codex-acp-linux-x64@0.9.5');
     expect(secondCallArgs).toContain('@zed-industries/codex-acp@0.9.5');
   });
 });
@@ -631,6 +631,6 @@ describe('connectCodex - Darwin optional dependency fallback', () => {
     const secondCallArgs = mockSpawn.mock.calls[1]?.[1];
 
     expect(firstCallArgs).toContain('@zed-industries/codex-acp@0.9.5');
-    expect(secondCallArgs).toContain('@zed-industries/codex-acp-darwin-x64');
+    expect(secondCallArgs).toContain('@zed-industries/codex-acp-darwin-x64@0.9.5');
   });
 });
